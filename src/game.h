@@ -21,6 +21,7 @@ public:
 
     void startTurn();  // rolls the die for the current player
     void nextTurn();   // advances to the next player and rolls
+    void forceDice(int value) { dice_ = value; }  // test helper
 
     std::vector<Point> legalDestinations(int player, int pawn) const;
     bool hasLegalMove(int player) const;

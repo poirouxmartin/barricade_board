@@ -89,7 +89,8 @@ void Game::explore(Point cur, Point prev, int steps, std::vector<Point>& out, in
 std::vector<Point> Game::legalDestinations(int player, int pawn) const {
     std::vector<Point> out;
     if (over_ || dice_ <= 0) return out;
-    const Point start = pawns_[player][pawn];
+    Point start = pawns_[player][pawn];
+    if (start.x < 0) start = baseCell(player, pawn);
     explore(start, start, dice_, out, player);
     return out;
 }
