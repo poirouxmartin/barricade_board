@@ -21,6 +21,61 @@ bool has(const std::vector<Point>& v, Point p) {
 }
 
 int main() {
+    // Board geometry matches the knauzi/Malefiz reference (Board.java).
+    {
+        const std::vector<std::vector<int>> refTrack{
+            {8},                                                         // y=0 goal
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},  // y=1
+            {0, 16},                                                     // y=2
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},  // y=3
+            {8},                                                         // y=4
+            {6, 7, 8, 9, 10},                                            // y=5
+            {6, 10},                                                     // y=6
+            {4, 5, 6, 7, 8, 9, 10, 11, 12},                              // y=7
+            {4, 12},                                                     // y=8
+            {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14},                // y=9
+            {2, 6, 10, 14},                                              // y=10
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},  // y=11
+            {0, 4, 8, 12, 16},                                           // y=12
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},  // y=13
+        };
+        const std::vector<Point> refBarricades{
+            {8, 1}, {8, 3}, {8, 4}, {8, 5}, {6, 7}, {10, 7},
+            {0, 11}, {4, 11}, {8, 11}, {12, 11}, {16, 11},
+        };
+        for (int y = 0; y < 14; ++y) {
+            for (int x = 0; x < 17; ++x) {
+                bool inRef = false;
+                for (int rx : refTrack[y]) {
+                    if (rx == x) inRef = true;
+                }
+                if (isTrackCell(x, y) != inRef) {
+                    std::printf("FAIL track (%d,%d): got=%d ref=%d\n", x, y, isTrackCell(x, y), inRef);
+                    ++failures;
+                }
+            }
+        }
+        for (const Point& p : refBarricades) {
+            if (!isInitialBarricadeCell(p.x, p.y)) {
+                std::printf("FAIL barricade missing (%d,%d)\n", p.x, p.y);
+                ++failures;
+            }
+        }
+        for (int y = 0; y < 14; ++y) {
+            for (int x = 0; x < 17; ++x) {
+                bool inRef = false;
+                for (const Point& b : refBarricades) {
+                    if (b.x == x && b.y == y) inRef = true;
+                }
+                if (isInitialBarricadeCell(x, y) != inRef) {
+                    std::printf("FAIL stray barricade (%d,%d)\n", x, y);
+                    ++failures;
+                }
+            }
+        }
+        check(isGoalCell(8, 0), "goal at (8,0)");
+    }
+
     // A pawn in base can always leave the base.
     {
         Game g(4);
