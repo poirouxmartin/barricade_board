@@ -170,6 +170,34 @@ check(g.placeBarricade(cells[0]), "barricade placed");
         check(g.placeBarricade(c), "ai placement applied");
     }
 
+    // MCTS returns a legal, applicable move for the current player.
+    {
+        Game g(2);
+        g.forceDice(3);
+        const AIMove mv = mctsMove(g, g.currentPlayer(), 200);
+        check(mv.pawn >= 0, "mcts picks a pawn");
+        if (mv.pawn >= 0) {
+            check(has(g.legalDestinations(g.currentPlayer(), mv.pawn), mv.dest), "mcts dest is legal");
+            check(g.movePawn(g.currentPlayer(), mv.pawn, mv.dest), "mcts move applies");
+        }
+    }
+
+    // MCTS is legal and applicable when a capture is available.
+    {
+        Game g(2);
+        g.forceDice(1);
+        g.movePawn(0, 0, {2, 13});
+        g.forceDice(1);
+        g.movePawn(1, 0, {6, 13});
+        g.forceDice(4);
+        const auto mv = mctsMove(g, g.currentPlayer(), 300);
+        check(mv.pawn >= 0, "mcts picks a pawn with capture available");
+        if (mv.pawn >= 0) {
+            check(has(g.legalDestinations(g.currentPlayer(), mv.pawn), mv.dest), "mcts dest is legal");
+            check(g.movePawn(g.currentPlayer(), mv.pawn, mv.dest), "mcts move applies");
+        }
+    }
+
     if (failures == 0) {
         std::printf("All smoke tests passed.\n");
         return 0;

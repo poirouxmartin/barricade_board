@@ -351,7 +351,7 @@ int main(int argc, char* argv[]) {
                 if (game.pendingBarricade()) {
                     game.placeBarricade(barricade::naiveBarricadePlacement(game));
                 } else {
-                    const auto mv = barricade::naiveMove(game, game.currentPlayer());
+                    const auto mv = barricade::mctsMove(game, game.currentPlayer(), 600);
                     if (mv.pawn >= 0) {
                         game.movePawn(game.currentPlayer(), mv.pawn, mv.dest);
                     }
