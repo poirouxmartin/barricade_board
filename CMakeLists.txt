@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(barricade_board LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(SDL2 CONFIG REQUIRED)
+
+add_executable(barricade_board
+    src/main.cpp
+    src/game.h
+    src/game.cpp
+)
+
+target_link_libraries(barricade_board PRIVATE SDL2::SDL2main SDL2::SDL2)
