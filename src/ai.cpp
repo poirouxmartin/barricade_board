@@ -163,6 +163,7 @@ double rollout(const Game& g0, int rootPlayer) {
 }
 
 struct MctsNode {
+    explicit MctsNode(Game g) : game(std::move(g)) {}
     Game game;
     int player = 0;
     int visits = 0;
@@ -197,7 +198,7 @@ MctsNode* createChild(MctsNode* n, size_t idx, std::mt19937& rng,
     }
     g.forceDice(1 + rng() % 6);
 
-    arena.emplace_back(new MctsNode);
+    arena.emplace_back(new MctsNode(std::move(g)));
     MctsNode* child = arena.back().get();
     child->game = std::move(g);
     child->player = child->game.currentPlayer();
@@ -266,8 +267,7 @@ AIMove mctsMove(const Game& game, int player, int budgetMs) {
     std::mt19937 rng(std::random_device{}());
     const auto start = std::chrono::steady_clock::now();
 
-    MctsNode root;
-    root.game = game;
+    MctsNode root(game);
     root.player = game.currentPlayer();
 
     std::vector<std::unique_ptr<MctsNode>> arena;
