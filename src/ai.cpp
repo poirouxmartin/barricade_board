@@ -4,8 +4,10 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace barricade {
@@ -14,8 +16,11 @@ namespace {
 
 constexpr int kInf = 1000000;
 constexpr double kUctC = 1.414;
-constexpr int kRolloutSteps = 80;
+constexpr int kRolloutSteps = 10;
 constexpr int kMaxIterations = 100000;
+}  // namespace
+
+namespace {
 
 int indexOf(Point p) {
     return p.y * kCols + p.x;
@@ -105,28 +110,6 @@ int progress(const Game& g, int player) {
     return best;
 }
 
-// Fast greedy move selection (no risk computation), used by rollouts.
-AIMove fastMove(const Game& g, int player) {
-    AIMove best;
-    int bestScore = -kInf;
-    for (int m = 0; m < kPawnsPerPlayer; ++m) {
-        const auto dests = g.legalDestinations(player, m);
-        const int curD = pawnDistToGoal(goalDist(), g, player, m);
-        if (curD == kInf) continue;
-        for (const Point& dest : dests) {
-            int score = (curD - distAt(goalDist(), dest)) * 20;
-            if (isGoalCell(dest.x, dest.y)) score += 1000000;
-            if (g.pawnAt(dest) >= 0) score += 1500;
-            if (g.barricadeAt(dest)) score += 600;
-            if (score > bestScore) {
-                bestScore = score;
-                best = {m, dest};
-            }
-        }
-    }
-    return best;
-}
-
 double heuristicEval(const Game& g, int rootPlayer) {
     int myMin = progress(g, rootPlayer);
     int oppMin = kInf;
@@ -141,8 +124,42 @@ double heuristicEval(const Game& g, int rootPlayer) {
     return v;
 }
 
+// Cheap rollout move: picks a random pawn that can move, then its best
+// destination by greedy score. Much cheaper than fastMove (1 DFS vs 5).
+AIMove cheapMove(const Game& g, int player, std::mt19937& rng) {
+    int order[5] = {0, 1, 2, 3, 4};
+    for (int i = 4; i > 0; --i) {
+        std::swap(order[i], order[rng() % (i + 1)]);
+    }
+    Point dests[512];
+    char seen[kCols * kRows];
+    for (int k = 0; k < kPawnsPerPlayer; ++k) {
+        const int m = order[k];
+        std::memset(seen, 0, sizeof seen);
+        const int n = g.legalDestinationsTo(player, m, dests, 512, seen);
+        if (n == 0) continue;
+        const int curD = pawnDistToGoal(goalDist(), g, player, m);
+        if (curD == kInf) continue;
+        int bestScore = -kInf;
+        AIMove best{m, dests[0]};
+        for (int i = 0; i < n; ++i) {
+            const Point dest = dests[i];
+            int score = (curD - distAt(goalDist(), dest)) * 20;
+            if (isGoalCell(dest.x, dest.y)) score += 1000000;
+            if (g.pawnAt(dest) >= 0) score += 1500;
+            if (g.barricadeAt(dest)) score += 600;
+            if (score > bestScore) {
+                bestScore = score;
+                best = {m, dest};
+            }
+        }
+        return best;
+    }
+    return AIMove{};
+}
+
 // Simulates a game from `g0` to the end (or horizon) using the heuristic.
-double rollout(const Game& g0, int rootPlayer) {
+double rollout(const Game& g0, int rootPlayer, std::mt19937& rng) {
     Game g = g0;
     for (int step = 0; step < kRolloutSteps && !g.isOver(); ++step) {
         if (g.pendingBarricade()) {
@@ -150,9 +167,9 @@ double rollout(const Game& g0, int rootPlayer) {
         } else if (g.dice() == 0) {
             g.startTurn();
         } else {
-            const AIMove mv = fastMove(g, g.currentPlayer());
+            const AIMove mv = cheapMove(g, g.currentPlayer(), rng);
             if (mv.pawn >= 0) {
-                g.movePawn(g.currentPlayer(), mv.pawn, mv.dest);
+                g.movePawnFast(g.currentPlayer(), mv.pawn, mv.dest);
             } else {
                 g.nextTurn();  // no legal move: skipped
             }
@@ -176,10 +193,12 @@ struct MctsNode {
 
 void fillActions(MctsNode* n) {
     if (!n->actions.empty()) return;
+    Point dests[512];
+    char seen[kCols * kRows];
     for (int m = 0; m < kPawnsPerPlayer; ++m) {
-        for (const Point& dest : n->game.legalDestinations(n->player, m)) {
-            n->actions.push_back({m, dest});
-        }
+        std::memset(seen, 0, sizeof seen);
+        const int cnt = n->game.legalDestinationsTo(n->player, m, dests, 512, seen);
+        for (int i = 0; i < cnt; ++i) n->actions.push_back({m, dests[i]});
     }
     if (n->actions.empty()) n->actions.push_back(AIMove{});  // skip pseudo-action
     n->children.assign(n->actions.size(), nullptr);
@@ -236,19 +255,23 @@ AIMove naiveMove(const Game& game, int player) {
 
     AIMove best;
     int bestScore = -kInf;
+    Point dests[512];
+    char seen[kCols * kRows];
     for (int m = 0; m < kPawnsPerPlayer; ++m) {
-        const auto dests = game.legalDestinations(player, m);
+        std::memset(seen, 0, sizeof seen);
+        const int n = game.legalDestinationsTo(player, m, dests, 512, seen);
         const int curD = pawnDistToGoal(goalDist(), game, player, m);
         if (curD == kInf) continue;
-        for (const Point& dest : dests) {
+        for (int i = 0; i < n; ++i) {
+            const Point dest = dests[i];
             int score = (curD - distAt(goalDist(), dest)) * 20;
             if (isGoalCell(dest.x, dest.y)) score += 1000000;
             const int victim = game.pawnAt(dest);
             if (victim >= 0) score += 1500;  // captures an opponent pawn
             if (game.barricadeAt(dest)) score += 600;
             int risk = 0;
-            for (size_t i = 0; i < opDists.size(); ++i) {
-                const int dd = opDists[i][indexOf(dest)];
+            for (size_t j = 0; j < opDists.size(); ++j) {
+                const int dd = opDists[j][indexOf(dest)];
                 if (dd > 0 && dd <= 6) ++risk;
             }
             score -= risk * 250;
@@ -261,8 +284,18 @@ AIMove naiveMove(const Game& game, int player) {
     return best;
 }
 
-AIMove mctsMove(const Game& game, int player, int budgetMs) {
-    if (game.dice() <= 0 || game.isOver()) return AIMove{};
+namespace {
+
+struct RootStats {
+    std::vector<AIMove> actions;
+    std::vector<long long> visits;
+    std::vector<double> scores;
+};
+
+// Runs a single-threaded MCTS search for `budgetMs` and returns root statistics.
+RootStats runSearch(const Game& game, int player, int budgetMs) {
+    RootStats stats;
+    if (game.dice() <= 0 || game.isOver()) return stats;
 
     std::mt19937 rng(std::random_device{}());
     const auto start = std::chrono::steady_clock::now();
@@ -273,9 +306,11 @@ AIMove mctsMove(const Game& game, int player, int budgetMs) {
     std::vector<std::unique_ptr<MctsNode>> arena;
 
     for (int iter = 0; iter < kMaxIterations; ++iter) {
-        const auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() >= budgetMs) {
-            break;
+        if ((iter & 31) == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() >= budgetMs) {
+                break;
+            }
         }
 
         MctsNode* n = &root;
@@ -304,29 +339,74 @@ AIMove mctsMove(const Game& game, int player, int budgetMs) {
         MctsNode* child = createChild(n, idx, rng, arena);
         if (!child) continue;
 
-        const double v = rollout(child->game, player);
+        const double v = rollout(child->game, player, rng);
         for (MctsNode* p = child; p; p = p->parent) {
             p->visits++;
             p->score += v;
         }
     }
 
-    // Pick the most-visited root child; break ties by average score.
-    size_t bestIdx = 0;
-    int bestVisits = -1;
-    double bestAvg = -2.0;
-    for (size_t i = 0; i < root.children.size(); ++i) {
-        const MctsNode* c = root.children[i];
-        if (!c) continue;
-        const double avg = c->score / c->visits;
-        if (c->visits > bestVisits || (c->visits == bestVisits && avg > bestAvg)) {
-            bestVisits = c->visits;
-            bestAvg = avg;
-            bestIdx = i;
+    stats.actions = root.actions;
+    stats.visits.assign(root.actions.size(), 0);
+    stats.scores.assign(root.actions.size(), 0.0);
+    for (size_t i = 0; i < root.actions.size(); ++i) {
+        if (root.children[i]) {
+            stats.visits[i] = root.children[i]->visits;
+            stats.scores[i] = root.children[i]->score;
         }
     }
-    if (bestVisits < 0) return naiveMove(game, player);
-    return root.actions[bestIdx];
+    return stats;
+}
+
+AIMove pickBest(const std::vector<RootStats>& results, const Game& game, int player) {
+    if (results.empty()) return naiveMove(game, player);
+    long long bestVisits = -1;
+    double bestAvg = -2.0;
+    int bestIdx = -1;
+    const auto& actions = results[0].actions;
+    for (size_t i = 0; i < actions.size(); ++i) {
+        long long v = 0;
+        double sc = 0.0;
+        for (const RootStats& r : results) {
+            if (i < r.visits.size()) {
+                v += r.visits[i];
+                sc += r.scores[i];
+            }
+        }
+        const double avg = v > 0 ? sc / v : -2.0;
+        if (v > bestVisits || (v == bestVisits && avg > bestAvg)) {
+            bestVisits = v;
+            bestAvg = avg;
+            bestIdx = static_cast<int>(i);
+        }
+    }
+    if (bestIdx < 0) return naiveMove(game, player);
+    return actions[bestIdx];
+}
+
+}  // namespace
+
+AIMove mctsMove(const Game& game, int player, int budgetMs) {
+    if (game.dice() <= 0 || game.isOver()) return AIMove{};
+
+    int nThreads = std::thread::hardware_concurrency();
+    if (nThreads < 1) nThreads = 1;
+    if (nThreads > 16) nThreads = 16;
+    if (nThreads == 1 || budgetMs < 40) {  // thread spawn overhead not worth it
+        const std::vector<RootStats> one{runSearch(game, player, budgetMs)};
+        return pickBest(one, game, player);
+    }
+
+    std::vector<RootStats> results(nThreads);
+    std::vector<std::thread> threads;
+    threads.reserve(nThreads);
+    for (int t = 0; t < nThreads; ++t) {
+        threads.emplace_back([&, t] { results[t] = runSearch(game, player, budgetMs); });
+    }
+    for (std::thread& th : threads) th.join();
+
+    const std::vector<RootStats> all(results.begin(), results.end());
+    return pickBest(all, game, player);
 }
 
 Point naiveBarricadePlacement(const Game& game) {

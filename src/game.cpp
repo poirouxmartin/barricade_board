@@ -13,6 +13,35 @@ int rollDie() {
     return 1 + rng() % 6;
 }
 
+struct Neighbors {
+    Point cells[4];
+    int count = 0;
+};
+
+// Static orthogonal adjacency table over the track graph.
+std::array<std::array<Neighbors, kRows>, kCols> buildNeighbors() {
+    std::array<std::array<Neighbors, kRows>, kCols> t{};
+    const int dx[4] = {1, -1, 0, 0};
+    const int dy[4] = {0, 0, 1, -1};
+    for (int y = 0; y < 14; ++y) {
+        for (int x = 0; x < kCols; ++x) {
+            if (!isTrackCell(x, y)) continue;
+            for (int k = 0; k < 4; ++k) {
+                const Point np{x + dx[k], y + dy[k]};
+                if (isTrackCell(np.x, np.y)) {
+                    t[x][y].cells[t[x][y].count++] = np;
+                }
+            }
+        }
+    }
+    return t;
+}
+
+const std::array<std::array<Neighbors, kRows>, kCols>& neighbors() {
+    static const auto t = buildNeighbors();
+    return t;
+}
+
 }  // namespace
 
 Game::Game(int playerCount) : player_count_(playerCount) {
@@ -31,11 +60,18 @@ void Game::reset() {
             pawns_[p][m] = {-1, -1};  // in base
         }
     }
+    for (int y = 0; y < kRows; ++y) {
+        for (int x = 0; x < kCols; ++x) {
+            barricade_grid_[x][y] = 0;
+            pawn_grid_[x][y] = -1;
+        }
+    }
     int b = 0;
     for (int y = 0; y < 14; ++y) {
         for (int x = 0; x < kCols; ++x) {
             if (isInitialBarricadeCell(x, y)) {
                 barricades_[b++] = {x, y};
+                barricade_grid_[x][y] = 1;
             }
         }
     }
@@ -52,46 +88,56 @@ void Game::nextTurn() {
 }
 
 bool Game::ownPawnAt(Point p, int player) const {
-    for (int m = 0; m < kPawnsPerPlayer; ++m) {
-        if (pawns_[player][m] == p) return true;
-    }
-    return false;
+    const int id = pawn_grid_[p.x][p.y];
+    return id >= 0 && id / kPawnsPerPlayer == player;
 }
 
-void Game::explore(Point cur, Point prev, int steps, std::vector<Point>& out, int player) const {
+void Game::explore(Point cur, Point prev, int steps, Point* out, int& count, int maxOut,
+                   int player, char* seen) const {
     if (steps == 0) {
         if (baseOwner(cur.x, cur.y) != -1) return;  // never land on a base
         if (ownPawnAt(cur, player)) return;
-        out.push_back(cur);
+        const int idx = cur.y * kCols + cur.x;
+        if (seen[idx]) return;  // already collected this cell
+        if (count >= maxOut) return;
+        seen[idx] = 1;
+        out[count++] = cur;
         return;
     }
 
-    Point cands[4];
     int n = 0;
+    Point cands[4];
     if (baseOwner(cur.x, cur.y) == player) {
         cands[n++] = baseFrontCell(player);
     } else {
-        const int dx[4] = {1, -1, 0, 0};
-        const int dy[4] = {0, 0, 1, -1};
-        for (int i = 0; i < 4; ++i) {
-            const Point np{cur.x + dx[i], cur.y + dy[i]};
-            if (isTrackCell(np.x, np.y)) cands[n++] = np;
-        }
+        const Neighbors& nb = neighbors()[cur.x][cur.y];
+        n = nb.count;
+        for (int i = 0; i < n; ++i) cands[i] = nb.cells[i];
     }
     for (int i = 0; i < n; ++i) {
         const Point np = cands[i];
-        if (np == prev) continue;                          // no double-back
-        if (steps > 1 && barricadeAt(np)) continue;        // cannot pass over a barricade
-        explore(np, cur, steps - 1, out, player);
+        if (np == prev) continue;                                   // no double-back
+        if (steps > 1 && barricade_grid_[np.x][np.y]) continue;     // cannot pass over a barricade
+        explore(np, cur, steps - 1, out, count, maxOut, player, seen);
     }
+}
+
+int Game::legalDestinationsTo(int player, int pawn, Point* out, int maxOut, char* seen) const {
+    if (over_ || dice_ <= 0) return 0;
+    int count = 0;
+    Point start = pawns_[player][pawn];
+    if (start.x < 0) start = baseCell(player, pawn);
+    explore(start, start, dice_, out, count, maxOut, player, seen);
+    return count;
 }
 
 std::vector<Point> Game::legalDestinations(int player, int pawn) const {
     std::vector<Point> out;
     if (over_ || dice_ <= 0) return out;
-    Point start = pawns_[player][pawn];
-    if (start.x < 0) start = baseCell(player, pawn);
-    explore(start, start, dice_, out, player);
+    Point buf[512];
+    std::array<char, kCols * kRows> seen{};
+    const int n = legalDestinationsTo(player, pawn, buf, 512, seen.data());
+    out.assign(buf, buf + n);
     return out;
 }
 
@@ -103,11 +149,22 @@ bool Game::hasLegalMove(int player) const {
     return false;
 }
 
+bool Game::movePawnFast(int player, int pawn, Point dest) {
+    return applyMove(player, pawn, dest);
+}
+
 bool Game::movePawn(int player, int pawn, Point dest) {
     if (over_ || player != current_) return false;
     const auto legal = legalDestinations(player, pawn);
     if (std::find(legal.begin(), legal.end(), dest) == legal.end()) return false;
+    return applyMove(player, pawn, dest);
+}
 
+bool Game::applyMove(int player, int pawn, Point dest) {
+    if (over_ || player != current_) return false;
+
+    const Point old = pawns_[player][pawn];
+    if (old.x >= 0) pawn_grid_[old.x][old.y] = -1;
     for (int p = 0; p < player_count_; ++p) {
         if (p == player) continue;
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
@@ -119,11 +176,13 @@ bool Game::movePawn(int player, int pawn, Point dest) {
             pending_barricade_ = true;
             captured_barricade_ = i;
             barricades_[i] = {-1, -1};
+            barricade_grid_[dest.x][dest.y] = 0;
             break;
         }
     }
 
     pawns_[player][pawn] = dest;
+    pawn_grid_[dest.x][dest.y] = player * kPawnsPerPlayer + pawn;
     if (isGoalCell(dest.x, dest.y)) {
         over_ = true;
         winner_ = player;
@@ -151,6 +210,7 @@ bool Game::placeBarricade(Point dest) {
     const auto cells = barricadePlacements();
     if (std::find(cells.begin(), cells.end(), dest) == cells.end()) return false;
     barricades_[captured_barricade_] = dest;
+    barricade_grid_[dest.x][dest.y] = 1;
     pending_barricade_ = false;
     if (!over_) nextTurn();
     return true;
@@ -167,19 +227,11 @@ bool Game::pawnInBase(int player, int pawn) const {
 }
 
 int Game::pawnAt(Point p) const {
-    for (int pl = 0; pl < kMaxPlayers; ++pl) {
-        for (int m = 0; m < kPawnsPerPlayer; ++m) {
-            if (pawns_[pl][m] == p) return pl * kPawnsPerPlayer + m;
-        }
-    }
-    return -1;
+    return pawn_grid_[p.x][p.y];
 }
 
 bool Game::barricadeAt(Point p) const {
-    for (int i = 0; i < kBarricadeCount; ++i) {
-        if (barricades_[i] == p) return true;
-    }
-    return false;
+    return barricade_grid_[p.x][p.y] != 0;
 }
 
 }  // namespace barricade

@@ -24,8 +24,13 @@ public:
     void forceDice(int value) { dice_ = value; }  // test helper
 
     std::vector<Point> legalDestinations(int player, int pawn) const;
+    // Hot-path variant: fills `out` (capacity maxOut) with distinct destinations.
+    // `seen` must be a zero-initialized kCols*kRows buffer. Returns the count.
+    int legalDestinationsTo(int player, int pawn, Point* out, int maxOut, char* seen) const;
     bool hasLegalMove(int player) const;
     bool movePawn(int player, int pawn, Point dest);
+    // Same as movePawn but skips the legality check; caller must ensure `dest` is legal.
+    bool movePawnFast(int player, int pawn, Point dest);
     std::vector<Point> barricadePlacements() const;
     bool placeBarricade(Point dest);
 
@@ -36,8 +41,10 @@ public:
     const std::array<Point, kBarricadeCount>& barricades() const { return barricades_; }
 
 private:
-    void explore(Point cur, Point prev, int steps, std::vector<Point>& out, int player) const;
+    void explore(Point cur, Point prev, int steps, Point* out, int& count, int maxOut,
+                 int player, char* seen) const;
     bool ownPawnAt(Point p, int player) const;
+    bool applyMove(int player, int pawn, Point dest);
 
     int player_count_;
     int current_ = 0;
@@ -49,6 +56,8 @@ private:
 
     std::array<std::array<Point, kPawnsPerPlayer>, kMaxPlayers> pawns_;
     std::array<Point, kBarricadeCount> barricades_;
+    std::array<std::array<char, kRows>, kCols> barricade_grid_{};
+    std::array<std::array<int, kRows>, kCols> pawn_grid_{};  // player*5+pawn or -1
 };
 
 }  // namespace barricade
