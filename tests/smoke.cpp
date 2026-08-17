@@ -1,3 +1,4 @@
+#include "ai.h"
 #include "game.h"
 
 #include <cstdio>
@@ -137,9 +138,36 @@ int main() {
             check(isTrackCell(c.x, c.y), "barricade placed on a track cell");
         }
         check(!cells.empty(), "at least one placement cell");
-        check(g.placeBarricade(cells[0]), "barricade placed");
+check(g.placeBarricade(cells[0]), "barricade placed");
         check(!g.pendingBarricade(), "placement resolved");
         check(g.barricadeAt(cells[0]), "barricade now at chosen cell");
+    }
+
+    // Naive AI returns a legal move for the current player.
+    {
+        Game g(2);
+        g.forceDice(3);
+        const AIMove mv = naiveMove(g, g.currentPlayer());
+        check(mv.pawn >= 0, "ai picks a pawn");
+        if (mv.pawn >= 0) {
+            check(has(g.legalDestinations(g.currentPlayer(), mv.pawn), mv.dest), "ai dest is legal");
+        }
+    }
+
+    // Naive AI barricade placement is a legal placement.
+    {
+        Game g(2);
+        g.forceDice(1);
+        g.movePawn(0, 0, {2, 13});
+        g.forceDice(1);
+        g.movePawn(1, 0, {6, 13});
+        g.forceDice(4);
+        check(g.movePawn(0, 0, {4, 11}), "capture barricade to test ai placement");
+        check(g.pendingBarricade(), "pending barricade");
+        const auto cells = g.barricadePlacements();
+        const Point c = naiveBarricadePlacement(g);
+        check(has(cells, c), "ai barricade placement is legal");
+        check(g.placeBarricade(c), "ai placement applied");
     }
 
     if (failures == 0) {

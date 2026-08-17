@@ -3,6 +3,7 @@
 #include <SDL.h>
 #include <SDL_ttf.h>
 
+#include "ai.h"
 #include "board.h"
 #include "game.h"
 
@@ -212,6 +213,14 @@ int main(int argc, char* argv[]) {
         playerCount = std::atoi(argv[1]);
         if (playerCount < 2 || playerCount > 4) playerCount = 4;
     }
+    int humanCount = 1;
+    if (argc > 2) {
+        humanCount = std::atoi(argv[2]);
+        if (humanCount < 0 || humanCount > playerCount) humanCount = 1;
+    }
+    const auto isAi = [humanCount](int p) { return p >= humanCount; };
+    constexpr Uint32 kAiDelay = 700;
+    Uint32 aiTick = 0;
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -329,6 +338,25 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+            }
+        }
+
+        // AI players play automatically, one action every kAiDelay ms.
+        if (!game.isOver() && isAi(game.currentPlayer())) {
+            if (game.dice() == 0) {
+                game.startTurn();
+                aiTick = SDL_GetTicks() + kAiDelay;
+            } else if (SDL_GetTicks() >= aiTick) {
+                selectedPawn = -1;
+                if (game.pendingBarricade()) {
+                    game.placeBarricade(barricade::naiveBarricadePlacement(game));
+                } else {
+                    const auto mv = barricade::naiveMove(game, game.currentPlayer());
+                    if (mv.pawn >= 0) {
+                        game.movePawn(game.currentPlayer(), mv.pawn, mv.dest);
+                    }
+                }
+                aiTick = SDL_GetTicks() + kAiDelay;
             }
         }
 

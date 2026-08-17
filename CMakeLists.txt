@@ -13,6 +13,8 @@ add_executable(barricade_board
     src/game.cpp
     src/board.h
     src/board.cpp
+    src/ai.h
+    src/ai.cpp
 )
 
 target_link_libraries(barricade_board PRIVATE SDL2::SDL2main SDL2::SDL2 SDL2_ttf::SDL2_ttf)
@@ -23,6 +25,8 @@ add_executable(smoke_test
     src/game.cpp
     src/board.h
     src/board.cpp
+    src/ai.h
+    src/ai.cpp
 )
 target_include_directories(smoke_test PRIVATE src)
 target_link_libraries(smoke_test PRIVATE)
