@@ -53,7 +53,7 @@ public:
     const std::array<Point, kBarricadeCount>& barricades() const { return barricades_; }
 
 private:
-    void explore(Point cur, Point prev, int steps, Point* out, int& count, int maxOut,
+    bool explore(Point cur, Point prev, int steps, Point* out, int& count, int maxOut,
                  int player, char* seen) const;
     bool ownPawnAt(Point p, int player) const;
     bool applyMove(int player, int pawn, Point dest);

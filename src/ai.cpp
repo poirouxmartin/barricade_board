@@ -233,7 +233,8 @@ AIMove cheapMoveFallback(const Game& g, int player, std::mt19937& rng) {
     for (int k = 0; k < kPawnsPerPlayer; ++k) {
         const int m = order[k];
         std::memset(seen, 0, sizeof seen);
-        const int n = g.legalDestinationsTo(player, m, dests, 512, seen);
+        // maxOut=1 stops the DFS at the first legal landing cell.
+        const int n = g.legalDestinationsTo(player, m, dests, 1, seen);
         if (n > 0) return {m, dests[0]};
     }
     return AIMove{};
@@ -422,13 +423,14 @@ SharedNode* uctSelectShared(SharedNode* n) {
     const double logNv = std::log(static_cast<double>(nv) + 1.0);
     SharedNode* best = nullptr;
     double bestUct = -1.0;
+    const double base = kUctC * std::sqrt(logNv);  // exploration weight, per selection
     for (SharedLink* l = n->children.load(std::memory_order_acquire); l; l = l->next) {
         SharedNode* c = l->node;
         if (!c) continue;
         const long long cv = c->visits.load(std::memory_order_acquire);
         if (cv == 0) return c;
-        const double uct = c->score.load(std::memory_order_relaxed) / cv +
-                           kUctC * std::sqrt(logNv / cv);
+        const double cs = c->score.load(std::memory_order_relaxed);
+        const double uct = cs / cv + base / std::sqrt(static_cast<double>(cv));
         if (uct > bestUct) {
             bestUct = uct;
             best = c;

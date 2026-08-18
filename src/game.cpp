@@ -85,17 +85,19 @@ bool Game::ownPawnAt(Point p, int player) const {
     return id != 255 && id / kPawnsPerPlayer == player;
 }
 
-void Game::explore(Point cur, Point prev, int steps, Point* out, int& count, int maxOut,
+// Depth-first walk collecting legal landing cells. Returns true when `out` is
+// full so callers can short-circuit (used to find just one destination).
+bool Game::explore(Point cur, Point prev, int steps, Point* out, int& count, int maxOut,
                    int player, char* seen) const {
     if (steps == 0) {
-        if (baseOwner(cur.x, cur.y) != -1) return;  // never land on a base
-        if (ownPawnAt(cur, player)) return;
+        if (baseOwner(cur.x, cur.y) != -1) return false;  // never land on a base
+        if (ownPawnAt(cur, player)) return false;
         const int idx = cur.y * kCols + cur.x;
-        if (seen[idx]) return;  // already collected this cell
-        if (count >= maxOut) return;
+        if (seen[idx]) return false;  // already collected this cell
+        if (count >= maxOut) return true;
         seen[idx] = 1;
         out[count++] = cur;
-        return;
+        return count >= maxOut;
     }
 
     int n = 0;
@@ -111,8 +113,9 @@ void Game::explore(Point cur, Point prev, int steps, Point* out, int& count, int
         const Point np = cands[i];
         if (np == prev) continue;                                   // no double-back
         if (steps > 1 && barricade_grid_[np.x][np.y]) continue;     // cannot pass over a barricade
-        explore(np, cur, steps - 1, out, count, maxOut, player, seen);
+        if (explore(np, cur, steps - 1, out, count, maxOut, player, seen)) return true;
     }
+    return false;
 }
 
 int Game::legalDestinationsTo(int player, int pawn, Point* out, int maxOut, char* seen) const {
