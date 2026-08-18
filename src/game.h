@@ -3,6 +3,7 @@
 #include "board.h"
 
 #include <array>
+#include <cstdint>
 #include <vector>
 
 namespace barricade {
@@ -41,6 +42,9 @@ public:
     bool movePawnFast(int player, int pawn, Point dest);
     std::vector<Point> barricadePlacements() const;
     bool placeBarricade(Point dest);
+    // Same as placeBarricade but skips the legality check; caller must ensure
+    // `dest` is legal (used by the AI search where the cell was already vetted).
+    bool placeBarricadeFast(Point dest);
 
     Point pawnPos(int player, int pawn) const;  // base cell when in base
     bool pawnInBase(int player, int pawn) const;
@@ -65,7 +69,7 @@ private:
     std::array<std::array<Point, kPawnsPerPlayer>, kMaxPlayers> pawns_;
     std::array<Point, kBarricadeCount> barricades_;
     std::array<std::array<char, kRows>, kCols> barricade_grid_{};
-    std::array<std::array<int, kRows>, kCols> pawn_grid_{};  // player*5+pawn or -1
+    std::array<std::array<uint8_t, kRows>, kCols> pawn_grid_{};  // player*5+pawn or 255
 };
 
 }  // namespace barricade

@@ -163,9 +163,67 @@ double heuristicEval(const Game& g, int rootPlayer) {
     return v;
 }
 
-// Cheap rollout move: picks a random pawn that can move, then its best
-// destination by greedy score. Much cheaper than fastMove (1 DFS vs 5).
-AIMove cheapMove(const Game& g, int player, std::mt19937& rng) {
+// Greedy walk used by the rollout: moves a pawn `g.dice()` steps towards the
+// goal, respecting the move rules (barricades block intermediate steps, the
+// final landing may capture). Returns {-1,-1} if the pawn cannot complete all
+// steps greedily.
+Point greedyWalkDest(const Game& g, int player, int pawn) {
+    const int dice = g.dice();
+    Point cur = g.pawnPos(player, pawn);
+    Point prev = cur;
+    bool inBase = g.pawnInBase(player, pawn);
+    const auto& dist = goalDist();
+    const auto& nb = neighbors();
+    for (int step = 0; step < dice; ++step) {
+        const bool last = step == dice - 1;
+        int n = 0;
+        Point cands[4];
+        if (inBase) {
+            const Point front = baseFrontCell(player);
+            if (last) {
+                const int pid = g.pawnAt(front);
+                if (pid >= 0 && pid / kPawnsPerPlayer == player) return {-1, -1};
+            }
+            cands[n++] = front;
+            inBase = false;
+        } else {
+            const Neighbors& c = nb[cur.x][cur.y];
+            for (int i = 0; i < c.count; ++i) {
+                const Point np = c.cells[i];
+                if (np.x == prev.x && np.y == prev.y) continue;
+                if (!last && g.barricadeAt(np)) continue;
+                if (last) {
+                    if (baseOwner(np.x, np.y) != -1) continue;
+                    const int pid = g.pawnAt(np);
+                    if (pid >= 0 && pid / kPawnsPerPlayer == player) continue;
+                }
+                cands[n++] = np;
+            }
+        }
+        if (n == 0) return {-1, -1};
+        int best = 0;
+        int bestScore = kInf;
+        for (int i = 0; i < n; ++i) {
+            const Point np = cands[i];
+            int score = distAt(dist, np);
+            if (last) {
+                if (g.pawnAt(np) >= 0) score -= 10000;     // capture an opponent pawn
+                else if (g.barricadeAt(np)) score -= 5000;  // capture a barricade
+            }
+            if (score < bestScore) {
+                bestScore = score;
+                best = i;
+            }
+        }
+        prev = cur;
+        cur = cands[best];
+    }
+    return cur;
+}
+
+// Minimal exact fallback of `cheapMove` (one DFS per pawn, no scoring): used
+// when the greedy walk finds no legal move for any pawn even though one exists.
+AIMove cheapMoveFallback(const Game& g, int player, std::mt19937& rng) {
     int order[5] = {0, 1, 2, 3, 4};
     for (int i = 4; i > 0; --i) {
         std::swap(order[i], order[rng() % (i + 1)]);
@@ -176,25 +234,24 @@ AIMove cheapMove(const Game& g, int player, std::mt19937& rng) {
         const int m = order[k];
         std::memset(seen, 0, sizeof seen);
         const int n = g.legalDestinationsTo(player, m, dests, 512, seen);
-        if (n == 0) continue;
-        const int curD = pawnDistToGoal(goalDist(), g, player, m);
-        if (curD == kInf) continue;
-        int bestScore = -kInf;
-        AIMove best{m, dests[0]};
-        for (int i = 0; i < n; ++i) {
-            const Point dest = dests[i];
-            int score = (curD - distAt(goalDist(), dest)) * 20;
-            if (isGoalCell(dest.x, dest.y)) score += 1000000;
-            if (g.pawnAt(dest) >= 0) score += 1500;
-            if (g.barricadeAt(dest)) score += 200;  // on-path removal already counted in dist gain
-            if (score > bestScore) {
-                bestScore = score;
-                best = {m, dest};
-            }
-        }
-        return best;
+        if (n > 0) return {m, dests[0]};
     }
     return AIMove{};
+}
+
+// Cheap rollout move: picks a random pawn and walks it greedily to the goal.
+// Falls back to an exact search when the walk finds no move for any pawn.
+AIMove cheapMove(const Game& g, int player, std::mt19937& rng) {
+    if (g.dice() <= 0) return {};
+    int order[5] = {0, 1, 2, 3, 4};
+    for (int i = 4; i > 0; --i) {
+        std::swap(order[i], order[rng() % (i + 1)]);
+    }
+    for (int k = 0; k < kPawnsPerPlayer; ++k) {
+        const Point d = greedyWalkDest(g, player, order[k]);
+        if (d.x >= 0) return {order[k], d};
+    }
+    return cheapMoveFallback(g, player, rng);
 }
 
 // Simulates a game from `g0` to the end (or horizon) using the heuristic.
@@ -202,7 +259,7 @@ double rollout(const Game& g0, int rootPlayer, std::mt19937& rng) {
     Game g = g0;
     for (int step = 0; step < kRolloutSteps && !g.isOver(); ++step) {
         if (g.pendingBarricade()) {
-            g.placeBarricade(cheapBarricadePlacement(g));
+            g.placeBarricadeFast(cheapBarricadePlacement(g));
         } else if (g.dice() == 0) {
             g.startTurn();
         } else {
@@ -228,7 +285,7 @@ struct SharedNode;
 struct SharedLink;
 
 struct SharedNode {
-    explicit SharedNode(Game g) : game(std::move(g)) {}
+    explicit SharedNode(Game&& g) : game(std::move(g)) {}
     Game game;
     int player = 0;
     std::atomic<long long> visits{0};
@@ -259,7 +316,7 @@ struct ThreadResult {
         char data[kLinkBlock * sizeof(SharedLink)];
     };
 
-    SharedNode* allocNode(Game g) {
+    SharedNode* allocNode(Game&& g) {
         if (nodesLeft == 0) {
             nodeBlocks.emplace_back(std::make_unique<NodeBlock>());
             nodeCursor = reinterpret_cast<SharedNode*>(nodeBlocks.back().get());
@@ -338,7 +395,9 @@ SharedNode* createChildShared(SharedNode* n, const AIMove& mv, std::mt19937& rng
     Game g = n->game;
     if (mv.pawn >= 0) {
         if (!g.movePawn(n->player, mv.pawn, mv.dest)) return nullptr;
-        if (g.pendingBarricade()) g.placeBarricade(cheapBarricadePlacement(g));
+        if (g.pendingBarricade()) {
+            g.placeBarricadeFast(cheapBarricadePlacement(g));
+        }
     } else {
         g.nextTurn();
     }
@@ -360,6 +419,7 @@ void publishChild(SharedNode* n, SharedNode* child, const AIMove& mv, ThreadResu
 
 SharedNode* uctSelectShared(SharedNode* n) {
     const long long nv = n->visits.load(std::memory_order_acquire);
+    const double logNv = std::log(static_cast<double>(nv) + 1.0);
     SharedNode* best = nullptr;
     double bestUct = -1.0;
     for (SharedLink* l = n->children.load(std::memory_order_acquire); l; l = l->next) {
@@ -368,7 +428,7 @@ SharedNode* uctSelectShared(SharedNode* n) {
         const long long cv = c->visits.load(std::memory_order_acquire);
         if (cv == 0) return c;
         const double uct = c->score.load(std::memory_order_relaxed) / cv +
-                           kUctC * std::sqrt(std::log(static_cast<double>(nv) + 1.0) / cv);
+                           kUctC * std::sqrt(logNv / cv);
         if (uct > bestUct) {
             bestUct = uct;
             best = c;
@@ -531,7 +591,7 @@ std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budge
     if (nThreads < 1) nThreads = 1;
     if (nThreads > 16) nThreads = 16;
 
-    auto root = std::make_unique<SharedNode>(game);
+    auto root = std::make_unique<SharedNode>(Game(game));
     root->player = root->game.currentPlayer();
     g_iterations.store(0, std::memory_order_relaxed);
 
@@ -640,13 +700,21 @@ Point cheapBarricadePlacement(const Game& game) {
     for (int om = 0; om < kPawnsPerPlayer; ++om) {
         myDist[om] = pawnDistToGoal(dist, game, game.currentPlayer(), om);
     }
+    int opDist[kMaxPlayers * kPawnsPerPlayer];
+    int nOp = 0;
+    for (int op = 0; op < game.playerCount(); ++op) {
+        if (op == game.currentPlayer()) continue;
+        for (int om = 0; om < kPawnsPerPlayer; ++om) {
+            opDist[nOp++] = pawnDistToGoal(dist, game, op, om);
+        }
+    }
 
     Point best{0, 0};
     int bestScore = -kInf;
     int scored = 0;
     for (const Point& c : pt.rank) {
         if (game.barricadeAt(c) || game.pawnAt(c) != -1) continue;
-        if (++scored > 10) break;
+        if (++scored > 5) break;
 
         const int cg = distAt(dist, c);
         const int fwd = pt.fwd[indexOf(c)];
@@ -654,12 +722,8 @@ Point cheapBarricadePlacement(const Game& game) {
         const int myImpact = (fwd == 1) ? 1000 : 2;
 
         int gain = 0;
-        for (int op = 0; op < game.playerCount(); ++op) {
-            if (op == game.currentPlayer()) continue;
-            for (int om = 0; om < kPawnsPerPlayer; ++om) {
-                const int a = pawnDistToGoal(dist, game, op, om);
-                if (a != kInf && cg < a) gain += oppImpact;
-            }
+        for (int i = 0; i < nOp; ++i) {
+            if (opDist[i] != kInf && cg < opDist[i]) gain += oppImpact;
         }
         int lose = 0;
         for (int om = 0; om < kPawnsPerPlayer; ++om) {

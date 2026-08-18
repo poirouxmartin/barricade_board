@@ -56,7 +56,7 @@ void Game::reset() {
     for (int y = 0; y < kRows; ++y) {
         for (int x = 0; x < kCols; ++x) {
             barricade_grid_[x][y] = 0;
-            pawn_grid_[x][y] = -1;
+            pawn_grid_[x][y] = 255;
         }
     }
     int b = 0;
@@ -81,8 +81,8 @@ void Game::nextTurn() {
 }
 
 bool Game::ownPawnAt(Point p, int player) const {
-    const int id = pawn_grid_[p.x][p.y];
-    return id >= 0 && id / kPawnsPerPlayer == player;
+    const uint8_t id = pawn_grid_[p.x][p.y];
+    return id != 255 && id / kPawnsPerPlayer == player;
 }
 
 void Game::explore(Point cur, Point prev, int steps, Point* out, int& count, int maxOut,
@@ -157,7 +157,7 @@ bool Game::applyMove(int player, int pawn, Point dest) {
     if (over_ || player != current_) return false;
 
     const Point old = pawns_[player][pawn];
-    if (old.x >= 0) pawn_grid_[old.x][old.y] = -1;
+    if (old.x >= 0) pawn_grid_[old.x][old.y] = 255;
     for (int p = 0; p < player_count_; ++p) {
         if (p == player) continue;
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
@@ -175,7 +175,7 @@ bool Game::applyMove(int player, int pawn, Point dest) {
     }
 
     pawns_[player][pawn] = dest;
-    pawn_grid_[dest.x][dest.y] = player * kPawnsPerPlayer + pawn;
+    pawn_grid_[dest.x][dest.y] = static_cast<uint8_t>(player * kPawnsPerPlayer + pawn);
     if (isGoalCell(dest.x, dest.y)) {
         over_ = true;
         winner_ = player;
@@ -209,6 +209,15 @@ bool Game::placeBarricade(Point dest) {
     return true;
 }
 
+bool Game::placeBarricadeFast(Point dest) {
+    if (!pending_barricade_) return false;
+    barricades_[captured_barricade_] = dest;
+    barricade_grid_[dest.x][dest.y] = 1;
+    pending_barricade_ = false;
+    if (!over_) nextTurn();
+    return true;
+}
+
 Point Game::pawnPos(int player, int pawn) const {
     const Point p = pawns_[player][pawn];
     if (p.x < 0) return baseCell(player, pawn);
@@ -220,7 +229,8 @@ bool Game::pawnInBase(int player, int pawn) const {
 }
 
 int Game::pawnAt(Point p) const {
-    return pawn_grid_[p.x][p.y];
+    const uint8_t v = pawn_grid_[p.x][p.y];
+    return v == 255 ? -1 : static_cast<int>(v);
 }
 
 bool Game::barricadeAt(Point p) const {
