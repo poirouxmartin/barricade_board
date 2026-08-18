@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -17,7 +18,7 @@ namespace {
 constexpr int kInf = 1000000;
 constexpr double kUctC = 1.414;
 constexpr int kRolloutSteps = 10;
-constexpr int kMaxIterations = 100000;
+constexpr int kMaxIterations = 2000000;
 }  // namespace
 
 namespace {
@@ -201,7 +202,7 @@ double rollout(const Game& g0, int rootPlayer, std::mt19937& rng) {
     Game g = g0;
     for (int step = 0; step < kRolloutSteps && !g.isOver(); ++step) {
         if (g.pendingBarricade()) {
-            g.placeBarricade(naiveBarricadePlacement(g));
+            g.placeBarricade(cheapBarricadePlacement(g));
         } else if (g.dice() == 0) {
             g.startTurn();
         } else {
@@ -217,20 +218,53 @@ double rollout(const Game& g0, int rootPlayer, std::mt19937& rng) {
     return heuristicEval(g, rootPlayer);
 }
 
-struct MctsNode {
-    explicit MctsNode(Game g) : game(std::move(g)) {}
+// ---------------------------------------------------------------------------
+// Shared-tree MCTS. All worker threads traverse ONE tree, so each node is
+// visited many more times than in a per-thread tree. Virtual loss keeps the
+// threads from piling onto the same node while it is being expanded.
+// ---------------------------------------------------------------------------
+
+struct SharedNode;
+struct SharedLink;
+
+struct SharedNode {
+    explicit SharedNode(Game g) : game(std::move(g)) {}
     Game game;
     int player = 0;
-    int visits = 0;
-    double score = 0.0;
+    std::atomic<long long> visits{0};
+    std::atomic<double> score{0.0};
+    std::atomic<int> expandLock{0};
+    std::atomic<bool> ready{false};
+    std::atomic<size_t> nextAction{0};
+    std::atomic<SharedLink*> children{nullptr};
     std::vector<AIMove> actions;
-    std::vector<size_t> unexpanded;
-    std::vector<MctsNode*> children;
-    MctsNode* parent = nullptr;
 };
 
-void fillActions(MctsNode* n) {
-    if (!n->actions.empty()) return;
+struct SharedLink {
+    AIMove action;
+    SharedNode* node;
+    SharedLink* next;
+};
+
+// Nodes/links a worker allocated; kept alive until the worker is joined
+// because the pointers are shared through the tree.
+struct ThreadResult {
+    std::vector<std::unique_ptr<SharedNode>> nodes;
+    std::vector<std::unique_ptr<SharedLink>> links;
+    long long iterations = 0;
+};
+
+constexpr double kVirtualLoss = 1.0;
+constexpr long long kMaxSharedNodes = 600000;
+std::atomic<long long> g_nodeCount{0};
+std::atomic<long long> g_iterations{0};
+
+// Builds the node's action list exactly once. Returns true if *this* thread
+// did the build (then `ready` is set with release ordering).
+bool expandNode(SharedNode* n) {
+    if (n->ready.load(std::memory_order_acquire)) return true;
+    int expected = 0;
+    if (!n->expandLock.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) return false;
     Point dests[512];
     char seen[kCols * kRows];
     for (int m = 0; m < kPawnsPerPlayer; ++m) {
@@ -239,39 +273,49 @@ void fillActions(MctsNode* n) {
         for (int i = 0; i < cnt; ++i) n->actions.push_back({m, dests[i]});
     }
     if (n->actions.empty()) n->actions.push_back(AIMove{});  // skip pseudo-action
-    n->children.assign(n->actions.size(), nullptr);
-    for (size_t i = 0; i < n->actions.size(); ++i) n->unexpanded.push_back(i);
+    n->ready.store(true, std::memory_order_release);
+    return true;
 }
 
-MctsNode* createChild(MctsNode* n, size_t idx, std::mt19937& rng,
-                      std::vector<std::unique_ptr<MctsNode>>& arena) {
+SharedNode* createChildShared(SharedNode* n, const AIMove& mv, std::mt19937& rng,
+                              ThreadResult& res) {
     Game g = n->game;
-    const AIMove& mv = n->actions[idx];
     if (mv.pawn >= 0) {
         if (!g.movePawn(n->player, mv.pawn, mv.dest)) return nullptr;
-        if (g.pendingBarricade()) g.placeBarricade(naiveBarricadePlacement(g));
+        if (g.pendingBarricade()) g.placeBarricade(cheapBarricadePlacement(g));
     } else {
         g.nextTurn();
     }
     g.forceDice(1 + rng() % 6);
 
-    arena.emplace_back(new MctsNode(std::move(g)));
-    MctsNode* child = arena.back().get();
-    child->game = std::move(g);
+    res.nodes.emplace_back(new SharedNode(std::move(g)));
+    SharedNode* child = res.nodes.back().get();
     child->player = child->game.currentPlayer();
-    child->parent = n;
-    n->children[idx] = child;
+    g_nodeCount.fetch_add(1, std::memory_order_relaxed);
     return child;
 }
 
-MctsNode* uctSelect(MctsNode* n, std::mt19937& rng) {
-    MctsNode* best = nullptr;
+void publishChild(SharedNode* n, SharedNode* child, const AIMove& mv, ThreadResult& res) {
+    res.links.emplace_back(new SharedLink{mv, child, nullptr});
+    SharedLink* link = res.links.back().get();
+    SharedLink* head = n->children.load(std::memory_order_acquire);
+    do {
+        link->next = head;
+    } while (!n->children.compare_exchange_weak(head, link, std::memory_order_release,
+                                                std::memory_order_acquire));
+}
+
+SharedNode* uctSelectShared(SharedNode* n) {
+    const long long nv = n->visits.load(std::memory_order_acquire);
+    SharedNode* best = nullptr;
     double bestUct = -1.0;
-    for (MctsNode* c : n->children) {
+    for (SharedLink* l = n->children.load(std::memory_order_acquire); l; l = l->next) {
+        SharedNode* c = l->node;
         if (!c) continue;
-        if (c->visits == 0) return c;
-        const double uct = c->score / c->visits +
-                           kUctC * std::sqrt(std::log(n->visits + 1) / c->visits);
+        const long long cv = c->visits.load(std::memory_order_acquire);
+        if (cv == 0) return c;
+        const double uct = c->score.load(std::memory_order_relaxed) / cv +
+                           kUctC * std::sqrt(std::log(static_cast<double>(nv) + 1.0) / cv);
         if (uct > bestUct) {
             bestUct = uct;
             best = c;
@@ -324,38 +368,6 @@ AIMove naiveMove(const Game& game, int player) {
 
 namespace {
 
-struct RootStats {
-    std::vector<AIMove> actions;
-    std::vector<long long> visits;
-    std::vector<double> scores;
-};
-
-// Merges per-thread root statistics into a single per-action list.
-struct ActionStats {
-    AIMove move;
-    long long visits = 0;
-    double score = 0.0;
-};
-
-std::vector<ActionStats> mergeStats(const std::vector<RootStats>& results) {
-    if (results.empty()) return {};
-    const auto& actions = results[0].actions;
-    std::vector<ActionStats> out;
-    out.reserve(actions.size());
-    for (size_t i = 0; i < actions.size(); ++i) {
-        ActionStats s;
-        s.move = actions[i];
-        for (const RootStats& r : results) {
-            if (i < r.visits.size()) {
-                s.visits += r.visits[i];
-                s.score += r.scores[i];
-            }
-        }
-        out.push_back(s);
-    }
-    return out;
-}
-
 AIMove pickBest(const std::vector<ActionStats>& stats, const Game& game, int player) {
     if (stats.empty()) return naiveMove(game, player);
     long long bestVisits = -1;
@@ -372,100 +384,127 @@ AIMove pickBest(const std::vector<ActionStats>& stats, const Game& game, int pla
     return best;
 }
 
-// Runs a single-threaded MCTS search for `budgetMs` and returns root statistics.
-RootStats runSearch(const Game& game, int player, int budgetMs) {
-    RootStats stats;
-    if (game.dice() <= 0 || game.isOver()) return stats;
-
+// One worker's share of the shared-tree search, running until the shared
+// deadline so every thread stops at the same moment.
+void sharedSearchLoop(SharedNode* root, int player,
+                      std::chrono::steady_clock::time_point start, int budgetMs,
+                      ThreadResult& res) {
     std::mt19937 rng(std::random_device{}());
-    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds(budgetMs);
+    std::vector<SharedNode*> path;
+    long long iter = 0;
+    while (iter < kMaxIterations) {
+        if ((iter & 31) == 0 && std::chrono::steady_clock::now() > deadline) break;
 
-    MctsNode root(game);
-    root.player = game.currentPlayer();
+        root->visits.fetch_add(1, std::memory_order_relaxed);
+        root->score.fetch_add(-kVirtualLoss, std::memory_order_relaxed);
+        path.push_back(root);
 
-    std::vector<std::unique_ptr<MctsNode>> arena;
-
-    for (int iter = 0; iter < kMaxIterations; ++iter) {
-        if ((iter & 31) == 0) {
-            const auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() >= budgetMs) {
+        SharedNode* n = root;
+        double v = 0.0;
+        while (true) {
+            if (g_nodeCount.load(std::memory_order_relaxed) >= kMaxSharedNodes) {
+                v = heuristicEval(n->game, player);
                 break;
             }
-        }
-
-        MctsNode* n = &root;
-        while (!n->game.isOver()) {
-            fillActions(n);
-            if (!n->unexpanded.empty()) break;
-            n = uctSelect(n, rng);
-            if (!n) break;
-        }
-
-        if (n->game.isOver()) {
-            const double v = n->game.winner() == player ? 1.0 : -1.0;
-            for (MctsNode* p = n; p; p = p->parent) {
-                p->visits++;
-                p->score += v;
+            if (!n->ready.load(std::memory_order_acquire)) {
+                if (!expandNode(n)) {
+                    std::this_thread::yield();
+                    continue;
+                }
             }
-            continue;
+            const size_t idx = n->nextAction.fetch_add(1, std::memory_order_relaxed);
+            if (idx < n->actions.size()) {
+                SharedNode* child = createChildShared(n, n->actions[idx], rng, res);
+                if (!child) {
+                    // movePawn rejected a supposedly legal move: undo the
+                    // virtual losses applied along the path and restart.
+                    for (SharedNode* p : path) {
+                        p->visits.fetch_add(-1, std::memory_order_relaxed);
+                        p->score.fetch_add(kVirtualLoss, std::memory_order_relaxed);
+                    }
+                    path.clear();
+                    break;
+                }
+                publishChild(n, child, n->actions[idx], res);
+                v = rollout(child->game, player, rng);
+                child->visits.fetch_add(1, std::memory_order_relaxed);
+                child->score.fetch_add(v, std::memory_order_relaxed);
+                break;
+            }
+            SharedNode* c = uctSelectShared(n);
+            if (!c) {
+                v = heuristicEval(n->game, player);
+                break;
+            }
+            n = c;
+            n->visits.fetch_add(1, std::memory_order_relaxed);
+            n->score.fetch_add(-kVirtualLoss, std::memory_order_relaxed);
+            path.push_back(n);
         }
 
-        fillActions(n);
-        if (n->unexpanded.empty()) continue;
-        const size_t pos = rng() % n->unexpanded.size();
-        const size_t idx = n->unexpanded[pos];
-        n->unexpanded.erase(n->unexpanded.begin() + pos);
-
-        MctsNode* child = createChild(n, idx, rng, arena);
-        if (!child) continue;
-
-        const double v = rollout(child->game, player, rng);
-        for (MctsNode* p = child; p; p = p->parent) {
-            p->visits++;
-            p->score += v;
+        for (SharedNode* p : path) {
+            p->visits.fetch_add(1, std::memory_order_relaxed);
+            p->score.fetch_add(v + kVirtualLoss, std::memory_order_relaxed);
         }
+        path.clear();
+        ++iter;
     }
-
-    stats.actions = root.actions;
-    stats.visits.assign(root.actions.size(), 0);
-    stats.scores.assign(root.actions.size(), 0.0);
-    for (size_t i = 0; i < root.actions.size(); ++i) {
-        if (root.children[i]) {
-            stats.visits[i] = root.children[i]->visits;
-            stats.scores[i] = root.children[i]->score;
-        }
-    }
-    return stats;
+    res.iterations = iter;
 }
 
 }  // namespace
 
-// Root-parallel MCTS: runs independent searches on `nThreads` threads, each
-// with the full `budgetMs`, then merges the root statistics.
+// Shared-tree MCTS: all workers traverse one tree; the root children's
+// statistics are read back once the threads have joined.
 std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budgetMs) {
     if (game.dice() <= 0 || game.isOver()) return {};
 
     int nThreads = std::thread::hardware_concurrency();
     if (nThreads < 1) nThreads = 1;
     if (nThreads > 16) nThreads = 16;
-    if (nThreads == 1 || budgetMs < 40) {  // thread spawn overhead not worth it
-        return mergeStats({runSearch(game, player, budgetMs)});
+
+    auto root = std::make_unique<SharedNode>(game);
+    root->player = root->game.currentPlayer();
+    g_nodeCount.store(1, std::memory_order_relaxed);
+    g_iterations.store(0, std::memory_order_relaxed);
+
+    const auto start = std::chrono::steady_clock::now();
+
+    std::vector<ThreadResult> results(nThreads);
+    if (nThreads == 1) {
+        sharedSearchLoop(root.get(), player, start, budgetMs, results[0]);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(nThreads);
+        for (int t = 0; t < nThreads; ++t) {
+            threads.emplace_back(
+                [&, t] { sharedSearchLoop(root.get(), player, start, budgetMs, results[t]); });
+        }
+        for (std::thread& th : threads) th.join();
     }
 
-    std::vector<RootStats> results(nThreads);
-    std::vector<std::thread> threads;
-    threads.reserve(nThreads);
-    for (int t = 0; t < nThreads; ++t) {
-        threads.emplace_back([&, t] { results[t] = runSearch(game, player, budgetMs); });
-    }
-    for (std::thread& th : threads) th.join();
+    long long totalIter = 0;
+    for (const ThreadResult& r : results) totalIter += r.iterations;
+    g_iterations.store(totalIter, std::memory_order_relaxed);
 
-    return mergeStats(results);
+    std::vector<ActionStats> out;
+    for (SharedLink* l = root->children.load(std::memory_order_acquire); l; l = l->next) {
+        if (!l->node || l->node->visits.load(std::memory_order_relaxed) <= 0) continue;
+        out.push_back({l->action, l->node->visits.load(std::memory_order_relaxed),
+                       l->node->score.load(std::memory_order_relaxed)});
+    }
+    return out;
 }
 
 AIMove mctsMove(const Game& game, int player, int budgetMs) {
     return pickBest(mctsActionStats(game, player, budgetMs), game, player);
 }
+
+// Diagnostics for tuning: iterations and tree nodes of the last
+// `mctsActionStats` call.
+long long mctsIterationCount() { return g_iterations.load(std::memory_order_relaxed); }
+long long mctsNodeCount() { return g_nodeCount.load(std::memory_order_relaxed); }
 
 std::vector<MctsRecommendation> mctsRecommendations(const Game& game, int player, int budgetMs) {
     std::vector<MctsRecommendation> out;
@@ -479,6 +518,95 @@ std::vector<MctsRecommendation> mctsRecommendations(const Game& game, int player
                   return a.visits > b.visits;
               });
     return out;
+}
+
+// Static data for the cheap placement: forward-neighbor count and a ranking
+// of candidate cells (choke points first, then by distance to the goal).
+struct PlacementTables {
+    std::array<char, kCols * kRows> fwd{};
+    std::vector<Point> rank;
+};
+
+const PlacementTables& placementTables() {
+    static const PlacementTables t = [] {
+        PlacementTables t;
+        for (int y = 0; y <= kBottomRowY; ++y) {
+            for (int x = 0; x < kCols; ++x) {
+                if (!isTrackCell(x, y) || y == kBottomRowY || isGoalCell(x, y)) continue;
+                const Point p{x, y};
+                const int cg = distAt(goalDist(), p);
+                if (cg == kInf) continue;
+                int f = 0;
+                const Neighbors& nb = neighbors()[x][y];
+                for (int i = 0; i < nb.count; ++i) {
+                    if (distAt(goalDist(), nb.cells[i]) < cg) ++f;
+                }
+                t.fwd[indexOf(p)] = static_cast<char>(f);
+                t.rank.push_back(p);
+            }
+        }
+        std::stable_sort(t.rank.begin(), t.rank.end(), [&t](const Point& a, const Point& b) {
+            const int fa = t.fwd[indexOf(a)];
+            const int fb = t.fwd[indexOf(b)];
+            if ((fa == 1) != (fb == 1)) return fa == 1;  // choke points first
+            return distAt(goalDist(), a) < distAt(goalDist(), b);
+        });
+        return t;
+    }();
+    return t;
+}
+
+// Very cheap barricade placement for the search (rollouts and tree descent).
+// Uses the static ranking and static goal distances, so it never runs a BFS.
+// The score mirrors `naiveBarricadePlacement`: a choke point (`fwd == 1`)
+// traps every pawn behind it (gain 40 / loss 1000), anything else just makes
+// pawns detour (gain/loss 2).
+Point cheapBarricadePlacement(const Game& game) {
+    const PlacementTables& pt = placementTables();
+    const auto& dist = goalDist();
+
+    int myDist[kPawnsPerPlayer];
+    for (int om = 0; om < kPawnsPerPlayer; ++om) {
+        myDist[om] = pawnDistToGoal(dist, game, game.currentPlayer(), om);
+    }
+
+    Point best{0, 0};
+    int bestScore = -kInf;
+    int scored = 0;
+    for (const Point& c : pt.rank) {
+        if (game.barricadeAt(c) || game.pawnAt(c) != -1) continue;
+        if (++scored > 10) break;
+
+        const int cg = distAt(dist, c);
+        const int fwd = pt.fwd[indexOf(c)];
+        const int oppImpact = (fwd == 1) ? 40 : 2;
+        const int myImpact = (fwd == 1) ? 1000 : 2;
+
+        int gain = 0;
+        for (int op = 0; op < game.playerCount(); ++op) {
+            if (op == game.currentPlayer()) continue;
+            for (int om = 0; om < kPawnsPerPlayer; ++om) {
+                const int a = pawnDistToGoal(dist, game, op, om);
+                if (a != kInf && cg < a) gain += oppImpact;
+            }
+        }
+        int lose = 0;
+        for (int om = 0; om < kPawnsPerPlayer; ++om) {
+            if (myDist[om] != kInf && cg < myDist[om]) lose += myImpact;
+        }
+        const int score = gain - lose;
+        if (score > bestScore) {
+            bestScore = score;
+            best = c;
+        }
+    }
+    if (bestScore == -kInf) {
+        // Very crowded board: nothing scored, return the first legal cell.
+        for (const Point& c : pt.rank) {
+            if (!game.barricadeAt(c) && game.pawnAt(c) == -1) return c;
+        }
+    }
+    return best;
 }
 
 Point naiveBarricadePlacement(const Game& game) {

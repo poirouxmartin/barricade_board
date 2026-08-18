@@ -5,44 +5,37 @@
 
 namespace barricade {
 
-namespace {
-
 int rollDie() {
     static std::random_device rd;
     static std::mt19937 rng(rd());
     return 1 + rng() % 6;
 }
 
-struct Neighbors {
-    Point cells[4];
-    int count = 0;
-};
+}  // namespace
+
+namespace barricade {
 
 // Static orthogonal adjacency table over the track graph.
-std::array<std::array<Neighbors, kRows>, kCols> buildNeighbors() {
-    std::array<std::array<Neighbors, kRows>, kCols> t{};
-    const int dx[4] = {1, -1, 0, 0};
-    const int dy[4] = {0, 0, 1, -1};
-    for (int y = 0; y < 14; ++y) {
-        for (int x = 0; x < kCols; ++x) {
-            if (!isTrackCell(x, y)) continue;
-            for (int k = 0; k < 4; ++k) {
-                const Point np{x + dx[k], y + dy[k]};
-                if (isTrackCell(np.x, np.y)) {
-                    t[x][y].cells[t[x][y].count++] = np;
+const std::array<std::array<Neighbors, kRows>, kCols>& neighbors() {
+    static const auto t = [] {
+        std::array<std::array<Neighbors, kRows>, kCols> t{};
+        const int dx[4] = {1, -1, 0, 0};
+        const int dy[4] = {0, 0, 1, -1};
+        for (int y = 0; y < 14; ++y) {
+            for (int x = 0; x < kCols; ++x) {
+                if (!isTrackCell(x, y)) continue;
+                for (int k = 0; k < 4; ++k) {
+                    const Point np{x + dx[k], y + dy[k]};
+                    if (isTrackCell(np.x, np.y)) {
+                        t[x][y].cells[t[x][y].count++] = np;
+                    }
                 }
             }
         }
-    }
+        return t;
+    }();
     return t;
 }
-
-const std::array<std::array<Neighbors, kRows>, kCols>& neighbors() {
-    static const auto t = buildNeighbors();
-    return t;
-}
-
-}  // namespace
 
 Game::Game(int playerCount) : player_count_(playerCount) {
     reset();

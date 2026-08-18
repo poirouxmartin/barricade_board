@@ -7,6 +7,14 @@
 
 namespace barricade {
 
+struct Neighbors {
+    Point cells[4];
+    int count = 0;
+};
+
+// Static orthogonal adjacency table over the track graph (public for the AI).
+const std::array<std::array<Neighbors, kRows>, kCols>& neighbors();
+
 class Game {
 public:
     explicit Game(int playerCount);
