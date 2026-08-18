@@ -34,7 +34,8 @@ struct ActionStats {
     long long visits = 0;
     double score = 0.0;
 };
-std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budgetMs);
+std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budgetMs,
+                                         int nThreads = 0);
 
 // Diagnostics from the last MCTS search: number of iterations and tree nodes.
 long long mctsIterationCount();
