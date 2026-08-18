@@ -89,8 +89,46 @@ std::vector<int> bfsFrom(Point src) {
     return dist;
 }
 
+// Weighted distance to the goal. Stepping onto a fixed barricade cell costs
+// kBarricadePenalty extra (landing on it to capture it takes an extra turn),
+// so the AI naturally prefers barricade-light routes instead of the center
+// column full of barricades.
+constexpr int kBarricadePenalty = 8;
+
+std::vector<int> buildGoalDist() {
+    std::vector<int> dist(kCols * kRows, kInf);
+    std::vector<char> done(kCols * kRows, 0);
+    const Point goal{8, 0};
+    dist[indexOf(goal)] = 0;
+
+    const int dx[4] = {1, -1, 0, 0};
+    const int dy[4] = {0, 0, 1, -1};
+    for (;;) {
+        int best = -1;
+        int bestDist = kInf;
+        for (int i = 0; i < kCols * kRows; ++i) {
+            if (!done[i] && dist[i] < bestDist) {
+                bestDist = dist[i];
+                best = i;
+            }
+        }
+        if (best < 0) break;
+        done[best] = 1;
+        const Point cur{best % kCols, best / kCols};
+        for (int k = 0; k < 4; ++k) {
+            const Point np{cur.x + dx[k], cur.y + dy[k]};
+            if (!isTrackCell(np.x, np.y)) continue;
+            const int cost = 1 + (isInitialBarricadeCell(np.x, np.y) ? kBarricadePenalty : 0);
+            const int nd = bestDist + cost;
+            const int ni = indexOf(np);
+            if (nd < dist[ni]) dist[ni] = nd;
+        }
+    }
+    return dist;
+}
+
 const std::vector<int>& goalDist() {
-    static const std::vector<int> d = bfsFromGoal({});
+    static const std::vector<int> d = buildGoalDist();
     return d;
 }
 
@@ -147,7 +185,7 @@ AIMove cheapMove(const Game& g, int player, std::mt19937& rng) {
             int score = (curD - distAt(goalDist(), dest)) * 20;
             if (isGoalCell(dest.x, dest.y)) score += 1000000;
             if (g.pawnAt(dest) >= 0) score += 1500;
-            if (g.barricadeAt(dest)) score += 600;
+            if (g.barricadeAt(dest)) score += 200;  // on-path removal already counted in dist gain
             if (score > bestScore) {
                 bestScore = score;
                 best = {m, dest};
@@ -268,7 +306,7 @@ AIMove naiveMove(const Game& game, int player) {
             if (isGoalCell(dest.x, dest.y)) score += 1000000;
             const int victim = game.pawnAt(dest);
             if (victim >= 0) score += 1500;  // captures an opponent pawn
-            if (game.barricadeAt(dest)) score += 600;
+            if (game.barricadeAt(dest)) score += 200;
             int risk = 0;
             for (size_t j = 0; j < opDists.size(); ++j) {
                 const int dd = opDists[j][indexOf(dest)];
@@ -291,6 +329,48 @@ struct RootStats {
     std::vector<long long> visits;
     std::vector<double> scores;
 };
+
+// Merges per-thread root statistics into a single per-action list.
+struct ActionStats {
+    AIMove move;
+    long long visits = 0;
+    double score = 0.0;
+};
+
+std::vector<ActionStats> mergeStats(const std::vector<RootStats>& results) {
+    if (results.empty()) return {};
+    const auto& actions = results[0].actions;
+    std::vector<ActionStats> out;
+    out.reserve(actions.size());
+    for (size_t i = 0; i < actions.size(); ++i) {
+        ActionStats s;
+        s.move = actions[i];
+        for (const RootStats& r : results) {
+            if (i < r.visits.size()) {
+                s.visits += r.visits[i];
+                s.score += r.scores[i];
+            }
+        }
+        out.push_back(s);
+    }
+    return out;
+}
+
+AIMove pickBest(const std::vector<ActionStats>& stats, const Game& game, int player) {
+    if (stats.empty()) return naiveMove(game, player);
+    long long bestVisits = -1;
+    double bestAvg = -2.0;
+    AIMove best;
+    for (const ActionStats& s : stats) {
+        const double avg = s.visits > 0 ? s.score / s.visits : -2.0;
+        if (s.visits > bestVisits || (s.visits == bestVisits && avg > bestAvg)) {
+            bestVisits = s.visits;
+            bestAvg = avg;
+            best = s.move;
+        }
+    }
+    return best;
+}
 
 // Runs a single-threaded MCTS search for `budgetMs` and returns root statistics.
 RootStats runSearch(const Game& game, int player, int budgetMs) {
@@ -358,43 +438,18 @@ RootStats runSearch(const Game& game, int player, int budgetMs) {
     return stats;
 }
 
-AIMove pickBest(const std::vector<RootStats>& results, const Game& game, int player) {
-    if (results.empty()) return naiveMove(game, player);
-    long long bestVisits = -1;
-    double bestAvg = -2.0;
-    int bestIdx = -1;
-    const auto& actions = results[0].actions;
-    for (size_t i = 0; i < actions.size(); ++i) {
-        long long v = 0;
-        double sc = 0.0;
-        for (const RootStats& r : results) {
-            if (i < r.visits.size()) {
-                v += r.visits[i];
-                sc += r.scores[i];
-            }
-        }
-        const double avg = v > 0 ? sc / v : -2.0;
-        if (v > bestVisits || (v == bestVisits && avg > bestAvg)) {
-            bestVisits = v;
-            bestAvg = avg;
-            bestIdx = static_cast<int>(i);
-        }
-    }
-    if (bestIdx < 0) return naiveMove(game, player);
-    return actions[bestIdx];
-}
-
 }  // namespace
 
-AIMove mctsMove(const Game& game, int player, int budgetMs) {
-    if (game.dice() <= 0 || game.isOver()) return AIMove{};
+// Root-parallel MCTS: runs independent searches on `nThreads` threads, each
+// with the full `budgetMs`, then merges the root statistics.
+std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budgetMs) {
+    if (game.dice() <= 0 || game.isOver()) return {};
 
     int nThreads = std::thread::hardware_concurrency();
     if (nThreads < 1) nThreads = 1;
     if (nThreads > 16) nThreads = 16;
     if (nThreads == 1 || budgetMs < 40) {  // thread spawn overhead not worth it
-        const std::vector<RootStats> one{runSearch(game, player, budgetMs)};
-        return pickBest(one, game, player);
+        return mergeStats({runSearch(game, player, budgetMs)});
     }
 
     std::vector<RootStats> results(nThreads);
@@ -405,8 +460,25 @@ AIMove mctsMove(const Game& game, int player, int budgetMs) {
     }
     for (std::thread& th : threads) th.join();
 
-    const std::vector<RootStats> all(results.begin(), results.end());
-    return pickBest(all, game, player);
+    return mergeStats(results);
+}
+
+AIMove mctsMove(const Game& game, int player, int budgetMs) {
+    return pickBest(mctsActionStats(game, player, budgetMs), game, player);
+}
+
+std::vector<MctsRecommendation> mctsRecommendations(const Game& game, int player, int budgetMs) {
+    std::vector<MctsRecommendation> out;
+    for (const ActionStats& s : mctsActionStats(game, player, budgetMs)) {
+        if (s.move.pawn < 0 || s.visits == 0) continue;
+        out.push_back({s.move, s.visits, s.score / s.visits});
+    }
+    std::sort(out.begin(), out.end(),
+              [](const MctsRecommendation& a, const MctsRecommendation& b) {
+                  if (a.value != b.value) return a.value > b.value;
+                  return a.visits > b.visits;
+              });
+    return out;
 }
 
 Point naiveBarricadePlacement(const Game& game) {
