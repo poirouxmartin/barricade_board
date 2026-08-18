@@ -539,7 +539,6 @@ void sharedSearchLoop(SharedNode* root, int player,
                     // virtual losses applied along the descent and restart.
                     for (size_t i = 1; i < path.size(); ++i) {
                         SharedNode* p = path[i];
-                        p->visits.fetch_add(-1, std::memory_order_relaxed);
                         p->score.fetch_add(kVirtualLoss, std::memory_order_relaxed);
                     }
                     path.clear();
@@ -558,14 +557,22 @@ void sharedSearchLoop(SharedNode* root, int player,
                 break;
             }
             n = c;
-            n->visits.fetch_add(1, std::memory_order_relaxed);
+            // Virtual loss on the score only: the visit increment is folded
+            // into the backup below (+2), halving the RMW traffic on the hot
+            // shared nodes. The score drop still deters other workers.
             n->score.fetch_add(-kVirtualLoss, std::memory_order_relaxed);
             path.push_back(n);
         }
 
         if (!aborted) {
-            for (SharedNode* p : path) {
-                p->visits.fetch_add(1, std::memory_order_relaxed);
+            // Path index 0 is the root, whose own stats are never read for
+            // selection; updating it per-iteration would serialize all threads
+            // on one cache line. The amortized batch below covers it instead.
+            for (size_t i = 1; i < path.size(); ++i) {
+                SharedNode* p = path[i];
+                // +2 visits: +1 from the descent (virtual visit) folded here,
+                // +1 from this iteration's real visit.
+                p->visits.fetch_add(2, std::memory_order_relaxed);
                 p->score.fetch_add(v + kVirtualLoss, std::memory_order_relaxed);
             }
             rootVisits += 2;
