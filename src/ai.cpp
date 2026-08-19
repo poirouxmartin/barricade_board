@@ -672,17 +672,32 @@ std::vector<int> playerProgress(const Game& game) {
     return out;
 }
 
-// Estimated win probabilities per player from the static goal distances
-// (shorter distance = higher chance), normalized to sum to 1.
+// Per-pawn weighted distance to the goal for `player`.
+std::vector<int> playerArmyDistances(const Game& game, int player) {
+    std::vector<int> out(kPawnsPerPlayer);
+    for (int m = 0; m < kPawnsPerPlayer; ++m) {
+        out[m] = pawnDistToGoal(goalDist(), game, player, m);
+    }
+    return out;
+}
+
+// Estimated win probabilities per player from the whole army: each pawn on
+// the track contributes 1/(dist+3), so advancing and having more pawns out of
+// the base improves the estimate. Normalized so the shares sum to 1.
 std::vector<double> winChances(const Game& game) {
     std::vector<double> out(game.playerCount());
-    double sum = 0.0;
+    const auto& dist = goalDist();
     for (int p = 0; p < game.playerCount(); ++p) {
-        int d = progress(game, p);
-        if (d > 30) d = 30;
-        out[p] = 1.0 / (d + 3.0);
-        sum += out[p];
+        double s = 0.0;
+        for (int m = 0; m < kPawnsPerPlayer; ++m) {
+            int d = pawnDistToGoal(dist, game, p, m);
+            if (d > 24) d = 24;
+            s += 1.0 / (d + 3.0);
+        }
+        out[p] = s;
     }
+    double sum = 0.0;
+    for (double v : out) sum += v;
     for (double& v : out) v /= sum;
     return out;
 }

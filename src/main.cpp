@@ -389,11 +389,11 @@ PanelLayout panelLayout() {
     PanelLayout L;
     L.adviseBtn = {kPanelX + kPanelPad, kStatusH + 50, kPanelW - 2 * kPanelPad, 34};
     const int y1 = kStatusH + 96;
-    const int y2 = y1 + 140 + 10;
-    const int y3 = y2 + 138 + 10;
-    const int y4 = y3 + 86 + 10;
-    const int adviceY = y4 + 86 + 10;
-    L.adviceBox = {kPanelX + kPanelPad, adviceY, kPanelW - 2 * kPanelPad, 150};
+    const int y2 = y1 + 124 + 10;
+    const int y3 = y2 + 146 + 10;
+    const int y4 = y3 + 166 + 10;
+    const int adviceY = y4 + 64 + 10;
+    L.adviceBox = {kPanelX + kPanelPad, adviceY, kPanelW - 2 * kPanelPad, 134};
     L.adviceClose = {L.adviceBox.x + L.adviceBox.w - 26, L.adviceBox.y + 7, 20, 20};
     return L;
 }
@@ -420,6 +420,23 @@ std::string fmt1(double v) {
     return s;
 }
 
+// MCTS value -> displayed "chance of winning" calibrated for the player count:
+// baseline 1/N at value 0, 100% at value +1. (For 2 players this is exactly
+// (1+v)/2; for 4 players a +0,54 lead reads ~66% instead of the 77% the
+// duelist formula gave.)
+int movePct(const barricade::Game& game, double value) {
+    const double n = game.playerCount();
+    double p = 1.0 / n + value * (1.0 - 1.0 / n);
+    if (p < 0.0) p = 0.0;
+    if (p > 1.0) p = 1.0;
+    return static_cast<int>(std::lround(p * 100.0));
+}
+
+// Same mapping applied to the last-search win probability (which is (1+v)/2).
+int deepPct(const barricade::Game& game, const barricade::SearchInfo& info) {
+    return movePct(game, info.winProb * 2.0 - 1.0);
+}
+
 void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade::Game& game,
                const AdviceView& advice, const barricade::SearchInfo& info,
                const std::string& lastAiText, bool humanTurn, bool match, int analysisMode) {
@@ -442,13 +459,13 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
     }
 
     // Recherche MCTS box
-    const SDL_Rect b1{cx, kStatusH + 96, cw, 140};
+    const SDL_Rect b1{cx, kStatusH + 96, cw, 124};
     drawBox(r, b1, "Recherche (MCTS)", font);
-    int yy = b1.y + 30;
+    int yy = b1.y + 26;
     const auto row = [&](const std::string& label, const std::string& value, SDL_Color vc) {
         renderText(r, small, label, b1.x + 10, yy, kTextDim);
         renderText(r, small, value, b1.x + 130, yy, vc);
-        yy += 18;
+        yy += 16;
     };
     if (info.iterations > 0) {
         char buf[48];
@@ -461,20 +478,20 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         row("Vitesse", buf, kTextColor);
         std::snprintf(buf, sizeof buf, "%s", fmt1(info.avgDepth).c_str());
         row("Profondeur moy.", buf, kTextColor);
-        std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(info.winProb * 100.0)));
+        std::snprintf(buf, sizeof buf, "%d%%", deepPct(game, info));
         row("Gain estime", buf, kGold);
     } else {
         row("Budget", "500 ms", kTextColor);
         row("", "aucune recherche", kTextDim);
     }
 
-    // Chances de gain box
-    const SDL_Rect b2{cx, b1.y + b1.h + 10, cw, 138};
-    drawBox(r, b2, "Chances de gain (heuristique)", font);
+    // Evaluation de la course box (whole-army static estimate + board state)
+    const SDL_Rect b2{cx, b1.y + b1.h + 10, cw, 146};
+    drawBox(r, b2, "Evaluation de la course (heuristique)", font);
     const std::vector<double> chances = barricade::winChances(game);
-    yy = b2.y + 30;
+    yy = b2.y + 26;
     for (int p = 0; p < game.playerCount(); ++p) {
-        const int barX = b2.x + 84, barW = 176, barH = 16, barY = yy + 4;
+        const int barX = b2.x + 84, barW = 150, barH = 14, barY = yy + 1;
         setColor(r, {15, 12, 8, 255});
         const SDL_Rect bg{barX, barY, barW, barH};
         SDL_RenderFillRect(r, &bg);
@@ -491,31 +508,79 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         renderText(r, small, buf, b2.x + 8, yy, kPlayerColors[p]);
         std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(chances[p] * 100.0)));
         renderText(r, small, buf, barX + barW + 8, yy, kTextColor);
-        yy += 24;
+        yy += 20;
     }
+    const std::vector<std::vector<int>> army = [&]() {
+        std::vector<std::vector<int>> v(game.playerCount());
+        for (int p = 0; p < game.playerCount(); ++p) v[p] = barricade::playerArmyDistances(game, p);
+        return v;
+    }();
+    char buf[128];
+    std::snprintf(buf, sizeof buf, "Dist. but (moy.) :");
+    for (int p = 0; p < game.playerCount(); ++p) {
+        int sum = 0, cnt = 0;
+        for (int d : army[p]) {
+            if (d > 999) continue;
+            sum += d;
+            ++cnt;
+        }
+        if (cnt == 0) {
+            std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " %s:-", kPlayerNames[p]);
+        } else {
+            std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " %s:%d",
+                          kPlayerNames[p], (sum + cnt / 2) / cnt);
+        }
+    }
+    renderText(r, small, buf, b2.x + 10, b2.y + 108, kTextColor);
+    std::snprintf(buf, sizeof buf, "Pions en piste :");
+    for (int p = 0; p < game.playerCount(); ++p) {
+        int out = 0;
+        for (int m = 0; m < barricade::kPawnsPerPlayer; ++m) {
+            if (!game.pawnInBase(p, m)) ++out;
+        }
+        std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " %s:%d", kPlayerNames[p], out);
+    }
+    renderText(r, small, buf, b2.x + 10, b2.y + 126, kTextColor);
+
+    // Heuristiques (parametres) box
+    const SDL_Rect b3{cx, b2.y + b2.h + 10, cw, 166};
+    drawBox(r, b3, "Heuristiques (parametres)", font);
+    yy = b3.y + 26;
+    const auto param = [&](const std::string& text) {
+        renderText(r, small, text, b3.x + 10, yy, kTextDim);
+        yy += 17;
+    };
+    param("Eval = (dist. adv - dist. moi)/10 + 0,05/pion");
+    param("Bloc adv. bloque : +60 (leader x2 si dist<=8)");
+    param("Bloc adv. detour : +1/case");
+    param("Bloc bloque ma piste : -1000 | detour : -2/case");
+    param("Penalite case bloc fixe (BFS) : +8");
+    param("Rollout : 10 pas | UCT C : 1,41");
+    param("Capture pion : +1500 | bloc : +200 | risque : -250");
+    param("Greedy (rollout) : capture -10000 | bloc -5000");
 
     // Strategie box
-    const SDL_Rect b3{cx, b2.y + b2.h + 10, cw, 86};
-    drawBox(r, b3, "Strategie / fin de partie", font);
+    const SDL_Rect b4{cx, b3.y + b3.h + 10, cw, 64};
+    drawBox(r, b4, "Strategie / fin de partie", font);
     std::string strategy = "—";
     if (match && !advice.busy) {
         if (analysisMode == 2 && !advice.placements.empty()) {
-            char buf[64];
-            std::snprintf(buf, sizeof buf, "Bloc -> (%d,%d)",
+            char line[64];
+            std::snprintf(line, sizeof line, "Bloc -> (%d,%d)",
                           advice.placements[0].cell.x, advice.placements[0].cell.y);
-            strategy = buf;
+            strategy = line;
         } else if (!advice.moves.empty()) {
             const auto& rec = advice.moves[0];
-            const int pct = static_cast<int>(std::lround(50 + rec.value * 50));
-            char buf[64];
-            std::snprintf(buf, sizeof buf, "P%d -> (%d,%d) : %d%%", rec.move.pawn + 1,
+            const int pct = movePct(game, rec.value);
+            char line[64];
+            std::snprintf(line, sizeof line, "P%d -> (%d,%d) : %d%%", rec.move.pawn + 1,
                           rec.move.dest.x, rec.move.dest.y, pct);
-            strategy = buf;
+            strategy = line;
         }
     } else if (!lastAiText.empty()) {
         strategy = lastAiText;
     }
-    renderText(r, small, strategy, b3.x + 10, b3.y + 28, kTextColor);
+    renderText(r, small, strategy, b4.x + 10, b4.y + 28, kTextColor);
     const std::vector<int> prog = barricade::playerProgress(game);
     int minP = -1, minD = 1000000;
     for (int p = 0; p < game.playerCount(); ++p) {
@@ -525,35 +590,12 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         }
     }
     if (minD <= 3) {
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "%s proche de la victoire !", kPlayerNames[minP]);
-        renderText(r, small, buf, b3.x + 10, b3.y + 52, kGold);
+        char line[64];
+        std::snprintf(line, sizeof line, "%s proche de la victoire !", kPlayerNames[minP]);
+        renderText(r, small, line, b4.x + 10, b4.y + 52, kGold);
     } else {
-        renderText(r, small, "Course vers le but", b3.x + 10, b3.y + 52, kTextDim);
+        renderText(r, small, "Course vers le but", b4.x + 10, b4.y + 52, kTextDim);
     }
-
-    // Heuristiques box
-    const SDL_Rect b4{cx, b3.y + b3.h + 10, cw, 86};
-    drawBox(r, b4, "Heuristiques", font);
-    std::string staticLine = "Statique (dist. but) :";
-    for (int p = 0; p < game.playerCount(); ++p) {
-        char buf[16];
-        if (prog[p] > 999) {
-            std::snprintf(buf, sizeof buf, " %s:-", kPlayerNames[p]);
-        } else {
-            std::snprintf(buf, sizeof buf, " %s:%d", kPlayerNames[p], prog[p]);
-        }
-        staticLine += buf;
-    }
-    renderText(r, small, staticLine, b4.x + 10, b4.y + 28, kTextColor);
-    char buf[64];
-    if (info.iterations > 0) {
-        std::snprintf(buf, sizeof buf, "Profond (MCTS) : %d%%",
-                      static_cast<int>(std::lround(info.winProb * 100.0)));
-    } else {
-        std::snprintf(buf, sizeof buf, "Profond (MCTS) : —");
-    }
-    renderText(r, small, buf, b4.x + 10, b4.y + 52, kTextDim);
 
     // Conseils box
     if (advice.show) {
@@ -590,7 +632,7 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
             yy = box.y + 30;
             for (size_t i = 0; i < n; ++i) {
                 const auto& rec = advice.moves[i];
-                const int pct = static_cast<int>(std::lround(50 + rec.value * 50));
+                const int pct = movePct(game, rec.value);
                 char line[48];
                 std::snprintf(line, sizeof line, "#%d  P%d -> (%d,%d)  %d%%", static_cast<int>(i) + 1,
                               rec.move.pawn + 1, rec.move.dest.x, rec.move.dest.y, pct);
@@ -1103,7 +1145,7 @@ int main(int argc, char* argv[]) {
                         skipPending = false;
                         closeAdvice();
                     } else {
-                        setMessage(msg, "Case invalide pour la barricade");
+                        setMessage(msg, "Bloc interdit : case occupee, rangee du bas ou but");
                     }
                     continue;
                 }

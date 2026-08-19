@@ -54,7 +54,11 @@ SearchInfo mctsInfo();
 // Static heuristic: each player's minimum distance to the goal (kInf if blocked).
 std::vector<int> playerProgress(const Game& game);
 
-// Estimated win probabilities per player (normalized so they sum to 1).
+// Per-pawn weighted distance to the goal for `player` (kInf if no path).
+std::vector<int> playerArmyDistances(const Game& game, int player);
+
+// Estimated win probabilities per player (normalized so they sum to 1),
+// based on the whole army: the sum of per-pawn weights 1/(dist+3).
 std::vector<double> winChances(const Game& game);
 
 // Greedy heuristic: picks a barricade placement that slows opponents
