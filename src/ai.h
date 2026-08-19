@@ -88,11 +88,11 @@ std::vector<double> simulateWinChances(const Game& game, long long nGames, int n
 
 // Background variant: keeps playing end-games on `nThreads` workers until
 // `*stop` is set or `targetGames` have been played, adding each finished game
-// to `gamesOut` and its winner to `winsOut` (both sized playerCount(), atomics).
+// to `gamesOut` and its winner to `winsOut` (an array of playerCount() atomics).
 // Returns when the workers have finished; call it from a background thread.
 void simulateWinChancesAsync(const Game& game, long long targetGames,
                              std::atomic<bool>* stop,
-                             std::vector<std::atomic<long long>>* winsOut,
+                             std::atomic<long long>* winsOut, int players,
                              std::atomic<long long>* gamesOut,
                              int nThreads = 0);
 

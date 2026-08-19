@@ -133,6 +133,14 @@ const std::vector<int>& goalDist() {
     return d;
 }
 
+// Unweighted BFS distance to the goal (no barricade penalty): the exact number
+// of steps needed to reach the goal, used to detect a pawn that can win this
+// turn.
+const std::vector<int>& rawGoalDist() {
+    static const std::vector<int> d = bfsFromGoal({});
+    return d;
+}
+
 int pawnDistToGoal(const std::vector<int>& dist, const Game& g, int player, int pawn) {
     if (g.pawnInBase(player, pawn)) {
         const int d = distAt(dist, baseFrontCell(player));
@@ -150,27 +158,43 @@ int progress(const Game& g, int player) {
 }
 
 double heuristicEval(const Game& g, int rootPlayer) {
+    if (g.isOver()) return g.winner() == rootPlayer ? 1.0 : -1.0;
+
+    const auto& raw = rawGoalDist();
     int myMin = kInf;
     int oppMin = kInf;
+    int myOne = kInf;  // exact number of steps to the goal (unweighted BFS)
+    int oppOne = kInf;
     int myOut = 0;
     int oppOut = 0;
     for (int p = 0; p < g.playerCount(); ++p) {
         int best = kInf;
+        int bestRaw = kInf;
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
             if (!g.pawnInBase(p, m)) {
                 if (p == rootPlayer) ++myOut;
                 else ++oppOut;
             }
             best = std::min(best, pawnDistToGoal(goalDist(), g, p, m));
+            bestRaw = std::min(bestRaw, pawnDistToGoal(raw, g, p, m));
         }
         if (p == rootPlayer) {
             myMin = best;
+            myOne = bestRaw;
         } else {
             oppMin = std::min(oppMin, best);
+            oppOne = std::min(oppOne, bestRaw);
         }
     }
     if (myMin == kInf) myMin = 30;
     if (oppMin == kInf) oppMin = 30;
+
+    // A pawn one exact step from the goal wins on the player's next turn (the
+    // goal cannot be barricaded), so it reads as a terminal position. The
+    // linear distance term would only score it as a small lead (1 vs 3 -> 20%).
+    if (myOne == 1 && oppOne > 1) return 1.0;
+    if (oppOne == 1 && myOne > 1) return -1.0;
+
     // Distance lead dominates; having more pawns on the track than the
     // opponents is worth a little extra.
     double v = (oppMin - myMin) / 10.0 + (myOut - oppOut) * 0.05;
@@ -182,8 +206,10 @@ double heuristicEval(const Game& g, int rootPlayer) {
 // Greedy walk used by the rollout: moves a pawn `g.dice()` steps towards the
 // goal, respecting the move rules (barricades block intermediate steps, the
 // final landing may capture). Returns {-1,-1} if the pawn cannot complete all
-// steps greedily.
-Point greedyWalkDest(const Game& g, int player, int pawn) {
+// steps greedily. Equal scores are broken randomly so the rollout does not
+// systematically favor one side of the board (the static neighbor table is
+// ordered right-first, which would bias a fixed tie-break).
+Point greedyWalkDest(const Game& g, int player, int pawn, std::mt19937& rng) {
     const int dice = g.dice();
     Point cur = g.pawnPos(player, pawn);
     Point prev = cur;
@@ -219,6 +245,8 @@ Point greedyWalkDest(const Game& g, int player, int pawn) {
         if (n == 0) return {-1, -1};
         int best = 0;
         int bestScore = kInf;
+        int ties[4];
+        int tieCount = 0;
         for (int i = 0; i < n; ++i) {
             const Point np = cands[i];
             int score = distAt(dist, np);
@@ -229,8 +257,13 @@ Point greedyWalkDest(const Game& g, int player, int pawn) {
             if (score < bestScore) {
                 bestScore = score;
                 best = i;
+                tieCount = 0;
+                ties[tieCount++] = i;
+            } else if (score == bestScore) {
+                ties[tieCount++] = i;
             }
         }
+        if (tieCount > 1) best = ties[rng() % tieCount];
         prev = cur;
         cur = cands[best];
     }
@@ -260,12 +293,37 @@ AIMove cheapMoveFallback(const Game& g, int player, std::mt19937& rng) {
 // Falls back to an exact search when the walk finds no move for any pawn.
 AIMove cheapMove(const Game& g, int player, std::mt19937& rng) {
     if (g.dice() <= 0) return {};
+    // A pawn that can land exactly on the goal this turn must always take the
+    // win; otherwise the random pawn order would waste the turn on another pawn
+    // and hand the game back to the opponents.
+    const auto& gd = rawGoalDist();
+    bool nearGoal = false;
+    for (int m = 0; m < kPawnsPerPlayer; ++m) {
+        const int d = pawnDistToGoal(gd, g, player, m);
+        if (d != kInf && d <= g.dice()) {
+            nearGoal = true;
+            break;
+        }
+    }
+    if (nearGoal) {
+        Point dests[512];
+        char seen[kCols * kRows];
+        for (int m = 0; m < kPawnsPerPlayer; ++m) {
+            const int d = pawnDistToGoal(gd, g, player, m);
+            if (d == kInf || d > g.dice()) continue;
+            std::memset(seen, 0, sizeof seen);
+            const int n = g.legalDestinationsTo(player, m, dests, 512, seen);
+            for (int i = 0; i < n; ++i) {
+                if (isGoalCell(dests[i].x, dests[i].y)) return {m, dests[i]};
+            }
+        }
+    }
     int order[5] = {0, 1, 2, 3, 4};
     for (int i = 4; i > 0; --i) {
         std::swap(order[i], order[rng() % (i + 1)]);
     }
     for (int k = 0; k < kPawnsPerPlayer; ++k) {
-        const Point d = greedyWalkDest(g, player, order[k]);
+        const Point d = greedyWalkDest(g, player, order[k], rng);
         if (d.x >= 0) return {order[k], d};
     }
     return cheapMoveFallback(g, player, rng);
@@ -683,8 +741,28 @@ std::vector<int> playerArmyDistances(const Game& game, int player) {
 
 // Estimated win probabilities per player from the whole army: each pawn on
 // the track contributes 1/(dist+3), so advancing and having more pawns out of
-// the base improves the estimate. Normalized so the shares sum to 1.
+// the base improves the estimate. Normalized so the shares sum to 1. A player
+// one exact step from the goal (and nobody else that close) is resolved as a
+// sure win, since 1/(dist+3) would only read ~40% for it.
 std::vector<double> winChances(const Game& game) {
+    const auto& raw = rawGoalDist();
+    int leader = -1;
+    for (int p = 0; p < game.playerCount(); ++p) {
+        int best = kInf;
+        for (int m = 0; m < kPawnsPerPlayer; ++m) {
+            best = std::min(best, pawnDistToGoal(raw, game, p, m));
+        }
+        if (best == 1) {
+            if (leader >= 0) leader = -2;  // two players one step away: fall through
+            else leader = p;
+        }
+    }
+    if (leader >= 0) {
+        std::vector<double> out(game.playerCount(), 0.0);
+        out[leader] = 1.0;
+        return out;
+    }
+
     std::vector<double> out(game.playerCount());
     const auto& dist = goalDist();
     for (int p = 0; p < game.playerCount(); ++p) {
@@ -906,7 +984,7 @@ std::vector<double> simulateWinChances(const Game& game, long long nGames, int n
     std::atomic<bool> stop{false};
     std::vector<std::atomic<long long>> wins(players);
     std::atomic<long long> games{0};
-    simulateWinChancesAsync(game, nGames, &stop, &wins, &games, nThreads);
+    simulateWinChancesAsync(game, nGames, &stop, wins.data(), players, &games, nThreads);
     std::vector<double> out(players, 0.0);
     long long total = 0;
     for (int p = 0; p < players; ++p) total += wins[p].load();
@@ -920,10 +998,9 @@ std::vector<double> simulateWinChances(const Game& game, long long nGames, int n
 
 void simulateWinChancesAsync(const Game& game, long long targetGames,
                              std::atomic<bool>* stop,
-                             std::vector<std::atomic<long long>>* winsOut,
+                             std::atomic<long long>* winsOut, int players,
                              std::atomic<long long>* gamesOut,
                              int nThreads) {
-    const int players = game.playerCount();
     if (nThreads < 1) nThreads = std::thread::hardware_concurrency();
     if (nThreads < 1) nThreads = 1;
     if (nThreads > 16) nThreads = 16;
@@ -938,7 +1015,7 @@ void simulateWinChancesAsync(const Game& game, long long targetGames,
                 if (gamesOut->load(std::memory_order_relaxed) >= targetGames) break;
                 const int w = simulateOneGame(game, rng);
                 if (w >= 0 && w < players) {
-                    winsOut->at(static_cast<size_t>(w)).fetch_add(1, std::memory_order_relaxed);
+                    winsOut[w].fetch_add(1, std::memory_order_relaxed);
                 }
                 gamesOut->fetch_add(1, std::memory_order_relaxed);
             }

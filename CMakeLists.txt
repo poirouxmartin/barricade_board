@@ -4,6 +4,12 @@ project(barricade_board LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Source files are UTF-8 (accented French UI strings); without this MSVC
+# reinterprets non-ASCII literals in the system codepage (mojibake in the UI).
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 find_package(SDL2 CONFIG REQUIRED)
 find_package(SDL2_ttf CONFIG REQUIRED)
 

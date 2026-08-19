@@ -4,7 +4,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <queue>
 #include <thread>
+#include <vector>
 
 using namespace barricade;
 
@@ -268,12 +271,95 @@ check(g.placeBarricade(cells[0]), "barricade placed");
         std::atomic<bool> stop{false};
         std::vector<std::atomic<long long>> wins(4);
         std::atomic<long long> games{0};
-        std::thread th([&] { simulateWinChancesAsync(g, 20000, &stop, &wins, &games, 2); });
+        std::thread th([&] {
+            simulateWinChancesAsync(g, 20000, &stop, wins.data(), g.playerCount(), &games, 2);
+        });
         std::this_thread::sleep_for(std::chrono::milliseconds(120));
         stop.store(true);
         th.join();
         check(games.load() > 0, "async simulation ran games");
         check(games.load() <= 20000, "async simulation stops at target");
+    }
+
+    // A player one step from the goal wins the vast majority of simulated
+    // end-games: the rollout policy must always take the immediate win instead
+    // of moving a random pawn (regression: cheapMove wasted the turn and the
+    // shares dropped to ~50% for the player about to win).
+    {
+        std::vector<int> dist(kCols * kRows, 1000000);
+        std::queue<Point> q;
+        dist[0 * kCols + 8] = 0;
+        q.push({8, 0});
+        while (!q.empty()) {
+            const Point cur = q.front();
+            q.pop();
+            const int d = dist[cur.y * kCols + cur.x];
+            const Neighbors& nb = neighbors()[cur.x][cur.y];
+            for (int i = 0; i < nb.count; ++i) {
+                const Point np = nb.cells[i];
+                const int idx = np.y * kCols + np.x;
+                if (dist[idx] == 1000000) {
+                    dist[idx] = d + 1;
+                    q.push(np);
+                }
+            }
+        }
+
+        Game g(4);
+        g.startTurn();
+        while (g.currentPlayer() != 3) g.nextTurn();
+        for (int guard = 0; guard < 80; ++guard) {
+            g.forceDice(1);
+            const auto dests = g.legalDestinations(3, 0);
+            if (dests.empty()) break;
+            int bestD = 1000000;
+            Point best = dests[0];
+            for (const Point& d : dests) {
+                const int sc = dist[d.y * kCols + d.x];
+                if (sc < bestD) {
+                    bestD = sc;
+                    best = d;
+                }
+            }
+            if (!g.movePawn(3, 0, best)) break;
+            if (g.isOver()) break;
+            if (g.pendingBarricade()) {
+                // Place the captured barricade far from green so the corridor
+                // stays open, like a human would.
+                const auto cells = g.barricadePlacements();
+                const Point gp = g.pawnPos(3, 0);
+                Point far = cells[0];
+                int farD = -1;
+                for (const Point& c : cells) {
+                    const int md = std::abs(c.x - gp.x) + std::abs(c.y - gp.y);
+                    if (md > farD) {
+                        farD = md;
+                        far = c;
+                    }
+                }
+                if (!g.placeBarricade(far)) break;
+            }
+            if (g.pawnPos(3, 0).x == 8 && g.pawnPos(3, 0).y == 1) break;
+            while (g.currentPlayer() != 3) g.nextTurn();
+        }
+        const Point pp = g.pawnPos(3, 0);
+        check(pp.x == 8 && pp.y == 1, "setup: green sits one step from the goal");
+        const auto p = simulateWinChances(g, 8000);
+        check(p[3] > 0.9, "green one step from the goal wins the simulated games");
+        const auto st = winChances(g);
+        check(st[3] > 0.9, "static heuristic also reads the one-step position as a sure win");
+    }
+
+    // A fresh symmetric game must not show a big starting-player bias: the
+    // greedy rollout used to break distance ties toward the right, which made
+    // the left side of the board win ~2/3 of the simulated games (red ~50%).
+    {
+        Game g(4);
+        g.startTurn();
+        const auto p = simulateWinChances(g, 12000);
+        for (int i = 0; i < 4; ++i) {
+            check(p[i] < 0.42, "no player gets a big starting advantage in the simulation");
+        }
     }
 
     if (failures == 0) {

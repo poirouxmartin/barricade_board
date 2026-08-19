@@ -9,9 +9,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -20,7 +23,7 @@
 namespace {
 
 constexpr int kCell = 40;
-constexpr int kStatusH = 48;
+constexpr int kStatusH = 56;
 constexpr int kFrame = 22;                                  // wooden frame around the board
 constexpr int kBoardW = barricade::kCols * kCell;           // 680
 constexpr int kBoardH = barricade::kRows * kCell;           // 760
@@ -52,6 +55,7 @@ const SDL_Color kPlayerColors[barricade::kMaxPlayers] = {
 };
 
 const char* kPlayerNames[barricade::kMaxPlayers] = {"Rouge", "Bleu", "Jaune", "Vert"};
+const char* kPlayerShorts[barricade::kMaxPlayers] = {"R", "B", "J", "V"};
 
 // Distinct colors for the numbered advice arrows (matches the panel legend).
 const SDL_Color kAdvicePalette[8] = {
@@ -300,27 +304,48 @@ void drawFadeRing(SDL_Renderer* r, barricade::Point cell, Uint32 at, Uint32 dur,
 }
 
 // Arrow with a numbered badge at its midpoint (badge number = advice rank).
+// The shaft is drawn with a dark outline and a filled arrowhead so it stays
+// readable over the wooden board.
 void drawArrow(SDL_Renderer* r, TTF_Font* font, barricade::Point from, barricade::Point to,
                SDL_Color c, int num) {
     const SDL_Rect a = cellRect(from), b = cellRect(to);
     const int x0 = a.x + kCell / 2, y0 = a.y + kCell / 2;
     const int x1 = b.x + kCell / 2, y1 = b.y + kCell / 2;
-    setColor(r, c);
-    drawLine(r, x0, y0, x1, y1);
     const double ang = std::atan2(static_cast<double>(y1 - y0), static_cast<double>(x1 - x0));
+    const double ux = std::cos(ang), uy = std::sin(ang);
+    const auto thickLine = [&](SDL_Color col, int w) {
+        setColor(r, col);
+        for (int k = -w; k <= w; ++k) {
+            const double ox = -uy * k, oy = ux * k;
+            drawLine(r, static_cast<int>(x0 + ox), static_cast<int>(y0 + oy),
+                     static_cast<int>(x1 + ox - ux * 9), static_cast<int>(y1 + oy - uy * 9));
+        }
+    };
+    thickLine({30, 24, 16, 230}, 2);  // dark outline
+    thickLine(c, 1);                  // colored shaft
+    // filled arrowhead (outlined, then bright)
+    const int hx = static_cast<int>(x1 - ux * 3), hy = static_cast<int>(y1 - uy * 3);
     for (int k = -1; k <= 1; k += 2) {
-        const double a2 = ang + k * 0.55;
-        drawLine(r, x1, y1, x1 - static_cast<int>(11 * std::cos(a2)),
-                 y1 - static_cast<int>(11 * std::sin(a2)));
+        const double a2 = ang + k * 0.5;
+        setColor(r, {30, 24, 16, 230});
+        drawLine(r, hx, hy, hx - static_cast<int>(17 * std::cos(a2)),
+                 hy - static_cast<int>(17 * std::sin(a2)));
     }
-    // number badge, offset perpendicular to the arrow to avoid overlaps
+    for (int k = -1; k <= 1; k += 2) {
+        const double a2 = ang + k * 0.44;
+        setColor(r, c);
+        drawLine(r, hx, hy, hx - static_cast<int>(14 * std::cos(a2)),
+                 hy - static_cast<int>(14 * std::sin(a2)));
+    }
+    // number badge on a dark disc with a colored ring
     const double len = std::hypot(static_cast<double>(x1 - x0), static_cast<double>(y1 - y0));
-    if (len > 0.0) {
-        const double px = -(y1 - y0) / len, py = (x1 - x0) / len;
-        const int mx = static_cast<int>((x0 + x1) / 2.0 + px * 14);
-        const int my = static_cast<int>((y0 + y1) / 2.0 + py * 14);
-        setColor(r, {24, 20, 14, 230});
-        fillCircle(r, mx, my, 11);
+    if (len > 20.0) {
+        const double px = -uy, py = ux;
+        const int mx = static_cast<int>(x0 + (x1 - x0) * 0.45 + px * 16);
+        const int my = static_cast<int>(y0 + (y1 - y0) * 0.45 + py * 16);
+        setColor(r, {18, 14, 9, 255});
+        fillCircle(r, mx, my, 13);
+        drawRing(r, mx, my, 13, {40, 32, 22, 255});
         drawRing(r, mx, my, 11, c);
         char buf[4];
         std::snprintf(buf, sizeof buf, "%d", num);
@@ -328,25 +353,161 @@ void drawArrow(SDL_Renderer* r, TTF_Font* font, barricade::Point from, barricade
     }
 }
 
-// Computer advice shown during a human turn. An analysis runs automatically
-// in the background for the current position; the overlay (arrows / placement
-// badges + panel list) is only revealed when the user toggles it with C.
-struct AdviceView {
-    bool show = false;  // overlay visible (user toggled)
-    bool busy = false;  // computation in progress
-    int player = -1;    // player the analysis was computed for
-    std::vector<barricade::MctsRecommendation> moves;
-    std::vector<barricade::BarricadeRecommendation> placements;
+// One candidate action with its end-game scenario: the MCTS recommendation
+// (move or barricade placement) plus each player's simulated win share after
+// playing it.
+struct ScenarioView {
+    barricade::AIMove move;          // pawn/dest (mode 1)
+    barricade::Point cell{-1, -1};   // barricade placement (mode 2)
+    bool isPlacement = false;
+    double value = 0.0;              // MCTS value or barricade score
+    long long visits = 0;            // MCTS visits (mode 1)
+    std::vector<double> shares;      // per-player end-game win shares
+    long long sims = 0;              // end-game games played for the shares
 };
 
+// Computer advice shown during a human turn. An analysis runs automatically
+// in the background for the current position; the overlay (arrows / placement
+// badges + panel list) is only revealed when the user toggles it with C and is
+// driven by the live analysis engine.
+struct AdviceView {
+    bool show = false;  // overlay visible (user toggled)
+    bool busy = false;  // auto-analysis in progress
+    int player = -1;    // player the analysis was computed for
+    std::vector<barricade::MctsRecommendation> moves;    // auto mode
+    std::vector<barricade::BarricadeRecommendation> placements;  // auto mode
+    std::vector<ScenarioView> scenarios;                 // engine mode
+    double bestGain = -1.0;  // current player's win% of the best move (-1 unknown)
+    long long bestSims = 0;  // games played for bestGain
+    bool engineActive = false;
+    double engineStepMs = 0.0;
+    double engineBaseMs = 500.0;
+    long long engineStep = 0;
+};
+
+// Live analysis engine: one persistent thread that waits for a work request
+// and then keeps deepening (doubling the step budget) until stopped or the
+// position changes, so the UI thread is never blocked (no join while running).
+struct AnalysisEngine {
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<ScenarioView> scenarios;   // last completed step (guarded by m)
+    std::atomic<bool> exit{false};
+    std::atomic<bool> want{false};         // work requested
+    std::atomic<bool> running{false};      // a session is deepening
+    std::atomic<bool> requestStop{true};   // stop the current session
+    std::atomic<bool> restart{false};      // reset the budget after this step
+    std::atomic<double> baseMs{500.0};     // user-set base budget
+    std::atomic<double> stepMs{0.0};       // budget of the last step
+    std::atomic<long long> step{0};        // steps completed in the session
+    uint64_t sig = 0;                      // position signature (guarded by m)
+    barricade::Game snapshot{4};           // guarded by m
+    int mode = 1;                          // guarded by m
+};
+
+void engineLoop(AnalysisEngine& E) {
+    std::unique_lock<std::mutex> lk(E.m);
+    while (true) {
+        E.cv.wait(lk, [&] { return E.exit.load() || E.want.load(); });
+        if (E.exit.load()) return;
+        E.want.store(false);
+        const barricade::Game snapshot = E.snapshot;
+        const int mode = E.mode;
+        lk.unlock();
+        E.running.store(true);
+        E.requestStop.store(false);
+        double budget = E.baseMs.load();
+        E.step.store(0);
+        while (!E.exit.load() && !E.requestStop.load() && !E.want.load()) {
+            std::vector<ScenarioView> sc;
+            if (mode == 2) {
+                const auto recs = barricade::barricadeRecommendations(snapshot, 4);
+                for (const auto& rec : recs) {
+                    barricade::Game child = snapshot;
+                    if (!child.placeBarricadeFast(rec.cell)) continue;
+                    ScenarioView sv;
+                    sv.cell = rec.cell;
+                    sv.isPlacement = true;
+                    sv.value = rec.score;
+                    sv.shares = barricade::simulateWinChances(child, 2000);
+                    sv.sims = 2000;
+                    sc.push_back(std::move(sv));
+                }
+            } else {
+                const auto recs =
+                    barricade::mctsRecommendations(snapshot, snapshot.currentPlayer(),
+                                                   static_cast<int>(budget));
+                for (const auto& rec : recs) {
+                    if (rec.move.pawn < 0) continue;
+                    barricade::Game child = snapshot;
+                    if (!child.movePawn(snapshot.currentPlayer(), rec.move.pawn, rec.move.dest)) {
+                        continue;
+                    }
+                    if (child.pendingBarricade()) {
+                        child.placeBarricadeFast(barricade::cheapBarricadePlacement(child));
+                    }
+                    ScenarioView sv;
+                    sv.move = rec.move;
+                    sv.value = rec.value;
+                    sv.visits = rec.visits;
+                    sv.shares = barricade::simulateWinChances(child, 2000);
+                    sv.sims = 2000;
+                    sc.push_back(std::move(sv));
+                }
+            }
+            {
+                std::lock_guard<std::mutex> guard(E.m);
+                E.scenarios = std::move(sc);
+                E.stepMs.store(budget);
+            }
+            E.step.fetch_add(1);
+            if (E.exit.load() || E.requestStop.load() || E.want.load()) break;
+            if (E.restart.load()) {
+                E.restart.store(false);
+                budget = E.baseMs.load();
+            } else {
+                budget = std::min(budget * 2.0, 2000.0);
+            }
+        }
+        E.running.store(false);
+        E.requestStop.store(false);
+        lk.lock();
+    }
+}
+
+// Controls of the live-analysis overlay header.
+struct EngineControls {
+    SDL_Rect minus, plus, relancer, stop;
+};
+EngineControls engineControlRects(const SDL_Rect& box) {
+    const int y = box.y + 28;
+    EngineControls c;
+    c.minus = {box.x + 10, y, 24, 22};
+    c.plus = {box.x + 98, y, 24, 22};
+    c.relancer = {box.x + 130, y, 72, 22};
+    c.stop = {box.x + 208, y, 88, 22};
+    return c;
+}
+
+void drawSmallButton(SDL_Renderer* r, TTF_Font* small, int x, int y, int w, int h,
+                     const std::string& label, bool armed) {
+    fillBevel(r, {x, y, w, h}, armed ? SDL_Color{90, 140, 60, 255} : SDL_Color{62, 52, 40, 255},
+              {130, 100, 80, 255}, {40, 34, 26, 255});
+    renderCentered(r, small, label, x + w / 2, y + h / 2 + 1, kTextColor);
+}
+
 void drawAdviceOverlay(SDL_Renderer* r, TTF_Font* font, const barricade::Game& game,
-                       const AdviceView& advice, bool match, int analysisMode) {
+                       const AdviceView& advice, bool match) {
     if (!advice.show || advice.busy || !match) return;
-    if (analysisMode == 2) {
+    const size_t n = std::min<size_t>(advice.scenarios.size(), 4);
+    const bool placementMode = !advice.scenarios.empty() && advice.scenarios[0].isPlacement;
+    if (placementMode) {
         // numbered placement badges on the recommended cells
-        const size_t n = std::min<size_t>(advice.placements.size(), 6);
         for (size_t i = 0; i < n; ++i) {
-            const SDL_Rect rc = cellRect(advice.placements[i].cell);
+            const auto& sv = advice.scenarios[i];
+            if (!sv.isPlacement) continue;
+            const SDL_Rect rc = cellRect(sv.cell);
             const int cx = rc.x + kCell / 2, cy = rc.y + kCell / 2;
             const SDL_Color c = kAdvicePalette[i % 8];
             drawRing(r, cx, cy, kCell / 2 - 4, c);
@@ -365,13 +526,13 @@ void drawAdviceOverlay(SDL_Renderer* r, TTF_Font* font, const barricade::Game& g
     }
     // move advice: numbered arrows
     const int cur = game.currentPlayer();
-    const size_t n = std::min<size_t>(advice.moves.size(), 6);
     for (size_t i = 0; i < n; ++i) {
-        const auto& rec = advice.moves[i];
-        drawArrow(r, font, game.pawnPos(cur, rec.move.pawn), rec.move.dest,
-                  kAdvicePalette[i % 8], static_cast<int>(i) + 1);
+        const auto& sv = advice.scenarios[i];
+        if (sv.isPlacement) continue;
+        drawArrow(r, font, game.pawnPos(cur, sv.move.pawn), sv.move.dest, kAdvicePalette[i % 8],
+                  static_cast<int>(i) + 1);
         if (i == 0) {
-            const SDL_Rect rc = cellRect(rec.move.dest);
+            const SDL_Rect rc = cellRect(sv.move.dest);
             setColor(r, {255, 255, 255, 200});
             SDL_RenderDrawRect(r, &rc);
         }
@@ -385,15 +546,20 @@ struct PanelLayout {
     SDL_Rect adviceClose;
 };
 
-PanelLayout panelLayout() {
+PanelLayout panelLayout(bool expandedOverlay) {
     PanelLayout L;
     L.adviseBtn = {kPanelX + kPanelPad, kStatusH + 50, kPanelW - 2 * kPanelPad, 34};
     const int y1 = kStatusH + 96;
     const int y2 = y1 + 124 + 10;
     const int y3 = y2 + 148 + 10;
     const int y4 = y3 + 170 + 10;
-    const int adviceY = y4 + 64 + 10;
-    L.adviceBox = {kPanelX + kPanelPad, adviceY, kPanelW - 2 * kPanelPad, 132};
+    if (expandedOverlay) {
+        // the conseils box grows over the params/strategy boxes (the gains box
+        // with its pause button stays visible)
+        L.adviceBox = {kPanelX + kPanelPad, y3, kPanelW - 2 * kPanelPad, kWinH - 30 - y3};
+    } else {
+        L.adviceBox = {kPanelX + kPanelPad, y4 + 64 + 10, kPanelW - 2 * kPanelPad, 132};
+    }
     L.adviceClose = {L.adviceBox.x + L.adviceBox.w - 26, L.adviceBox.y + 7, 20, 20};
     return L;
 }
@@ -420,6 +586,17 @@ std::string fmt1(double v) {
     return s;
 }
 
+std::string fmtMs(double ms) {
+    char b[32];
+    if (ms >= 1000.0) {
+        std::snprintf(b, sizeof b, "%.0f s", ms / 1000.0);
+    } else {
+        std::snprintf(b, sizeof b, "%.1f s", ms / 1000.0);
+        for (char& ch : b) if (ch == '.') ch = ',';
+    }
+    return b;
+}
+
 // MCTS value -> displayed "chance of winning" calibrated for the player count:
 // baseline 1/N at value 0, 100% at value +1. (For 2 players this is exactly
 // (1+v)/2; for 4 players a +0,54 lead reads ~66% instead of the 77% the
@@ -440,10 +617,10 @@ int deepPct(const barricade::Game& game, const barricade::SearchInfo& info) {
 void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade::Game& game,
                const AdviceView& advice, const barricade::SearchInfo& info,
                const std::string& lastAiText, bool humanTurn, bool match, int analysisMode,
-               long long simGames, const std::vector<double>& simShares) {
+               long long simGames, const std::vector<double>& simShares, bool simPaused) {
     const int cx = kPanelX + kPanelPad;
     const int cw = kPanelW - 2 * kPanelPad;
-    const PanelLayout L = panelLayout();
+    const PanelLayout L = panelLayout(advice.show);
 
     // Panel title
     renderText(r, font, "Analyse IA", cx, kStatusH + 12, kTextColor);
@@ -478,8 +655,15 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         row("Vitesse", buf, kTextColor);
         std::snprintf(buf, sizeof buf, "%s", fmt1(info.avgDepth).c_str());
         row("Profondeur moy.", buf, kTextColor);
-        std::snprintf(buf, sizeof buf, "%d%%", deepPct(game, info));
-        row("Gain estime", buf, kGold);
+        // real end-game estimate (from the position simulation), coherent with
+        // the bars below; falls back to the short-horizon MCTS value.
+        if (simGames > 0 && !simShares.empty()) {
+            std::snprintf(buf, sizeof buf, "%d%%",
+                          static_cast<int>(std::lround(simShares[game.currentPlayer()] * 100.0)));
+        } else {
+            std::snprintf(buf, sizeof buf, "%d%%", deepPct(game, info));
+        }
+        row("Chance de gain", buf, kGold);
     } else {
         row("Budget", "500 ms", kTextColor);
         row("", "aucune recherche", kTextDim);
@@ -487,16 +671,16 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
 
     // Evaluation des gains box: static whole-army heuristic vs end-game simulation
     const SDL_Rect b2{cx, b1.y + b1.h + 10, cw, 148};
-    drawBox(r, b2, "Evaluation des gains (statique vs simule)", font);
+    drawBox(r, b2, "Gains : statique vs simule", font);
     const std::vector<double> chances = barricade::winChances(game);
     yy = b2.y + 26;
     char buf[64];
     for (int p = 0; p < game.playerCount(); ++p) {
         const int statBarX = b2.x + 76, statBarW = 44;
-        const int simBarX = b2.x + 178, simBarW = 70;
+        const int simBarX = b2.x + 182, simBarW = 70;
         const int yb = yy + 1, barH = 12;
         renderText(r, small, kPlayerNames[p], b2.x + 8, yy, kPlayerColors[p]);
-        renderText(r, small, "stat", b2.x + 50, yy, kTextDim);
+        renderText(r, small, "stat", b2.x + 52, yy, kTextDim);
         setColor(r, {15, 12, 8, 255});
         const SDL_Rect sbg{statBarX, yb, statBarW, barH};
         SDL_RenderFillRect(r, &sbg);
@@ -510,7 +694,7 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         SDL_RenderDrawRect(r, &sbg);
         std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(chances[p] * 100.0)));
         renderText(r, small, buf, statBarX + statBarW + 4, yy, kTextColor);
-        renderText(r, small, "sim", b2.x + 152, yy, kTextDim);
+        renderText(r, small, "sim", b2.x + 156, yy, kTextDim);
         const double sim = simShares.empty() ? 0.0 : simShares[p];
         setColor(r, {15, 12, 8, 255});
         const SDL_Rect ibg{simBarX, yb, simBarW, barH};
@@ -527,13 +711,17 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         renderText(r, small, buf, simBarX + simBarW + 4, yy, kTextColor);
         yy += 26;
     }
-    if (simGames > 0) {
-        std::snprintf(buf, sizeof buf, "Simulation : %s parties (fin de partie)",
-                      groupThousands(simGames).c_str());
+    // simulation counter + pause/resume toggle
+    if (simPaused) {
+        std::snprintf(buf, sizeof buf, "Simulation : PAUSEE");
+    } else if (simGames > 0) {
+        std::snprintf(buf, sizeof buf, "Simulation : %s parties", groupThousands(simGames).c_str());
     } else {
         std::snprintf(buf, sizeof buf, "Simulation : en cours...");
     }
     renderText(r, small, buf, b2.x + 10, b2.y + 128, kGold);
+    drawSmallButton(r, small, b2.x + cw - 66, b2.y + 124, 58, 20,
+                    simPaused ? "Lancer" : "Pause", false);
 
     // Heuristiques (parametres) box: live inputs + scoring constants
     const std::vector<std::vector<int>> army = [&]() {
@@ -544,7 +732,7 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
     const SDL_Rect b3{cx, b2.y + b2.h + 10, cw, 170};
     drawBox(r, b3, "Heuristiques (parametres)", font);
     yy = b3.y + 26;
-    std::snprintf(buf, sizeof buf, "Dist. but (moy.) :");
+    std::snprintf(buf, sizeof buf, "Dist. but :");
     for (int p = 0; p < game.playerCount(); ++p) {
         int sum = 0, cnt = 0;
         for (int d : army[p]) {
@@ -553,10 +741,11 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
             ++cnt;
         }
         if (cnt == 0) {
-            std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " %s:-", kPlayerNames[p]);
+            std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " %s:-",
+                          kPlayerShorts[p]);
         } else {
             std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " %s:%d",
-                          kPlayerNames[p], (sum + cnt / 2) / cnt);
+                          kPlayerShorts[p], (sum + cnt / 2) / cnt);
         }
     }
     renderText(r, small, buf, b3.x + 10, yy, kTextColor);
@@ -572,24 +761,47 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
     param("Penalite case bloc fixe (BFS) : +8");
     param("Rollout : 10 pas | UCT C : 1,41");
     param("Capture pion : +1500 | bloc : +200 | risque : -250");
-    param("Greedy (rollout) : capture -10000 | bloc -5000");
+    param("Greedy rollout : cap -10000, bloc -5000");
 
     // Strategie box
     const SDL_Rect b4{cx, b3.y + b3.h + 10, cw, 64};
     drawBox(r, b4, "Strategie / fin de partie", font);
     std::string strategy = "—";
     if (match && !advice.busy) {
-        if (analysisMode == 2 && !advice.placements.empty()) {
-            char line[64];
+        char line[64];
+        if (analysisMode == 2 && !advice.scenarios.empty()) {
+            std::snprintf(line, sizeof line, "Bloc -> (%d,%d)",
+                          advice.scenarios[0].cell.x, advice.scenarios[0].cell.y);
+            strategy = line;
+        } else if (!advice.scenarios.empty()) {
+            const auto& sv = advice.scenarios[0];
+            const int pct = !sv.shares.empty()
+                                ? static_cast<int>(std::lround(sv.shares[game.currentPlayer()] * 100.0))
+                                : -1;
+            if (pct >= 0) {
+                std::snprintf(line, sizeof line, "P%d -> (%d,%d) : %d%%", sv.move.pawn + 1,
+                              sv.move.dest.x, sv.move.dest.y, pct);
+            } else {
+                std::snprintf(line, sizeof line, "P%d -> (%d,%d)", sv.move.pawn + 1,
+                              sv.move.dest.x, sv.move.dest.y);
+            }
+            strategy = line;
+        } else if (analysisMode == 2 && !advice.placements.empty()) {
             std::snprintf(line, sizeof line, "Bloc -> (%d,%d)",
                           advice.placements[0].cell.x, advice.placements[0].cell.y);
             strategy = line;
         } else if (!advice.moves.empty()) {
             const auto& rec = advice.moves[0];
-            const int pct = movePct(game, rec.value);
-            char line[64];
-            std::snprintf(line, sizeof line, "P%d -> (%d,%d) : %d%%", rec.move.pawn + 1,
-                          rec.move.dest.x, rec.move.dest.y, pct);
+            const int pct = advice.bestGain >= 0.0
+                                ? static_cast<int>(std::lround(advice.bestGain * 100.0))
+                                : -1;
+            if (pct >= 0) {
+                std::snprintf(line, sizeof line, "P%d -> (%d,%d) : %d%%", rec.move.pawn + 1,
+                              rec.move.dest.x, rec.move.dest.y, pct);
+            } else {
+                std::snprintf(line, sizeof line, "P%d -> (%d,%d)", rec.move.pawn + 1,
+                              rec.move.dest.x, rec.move.dest.y);
+            }
             strategy = line;
         }
     } else if (!lastAiText.empty()) {
@@ -612,10 +824,14 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         renderText(r, small, "Course vers le but", b4.x + 10, b4.y + 52, kTextDim);
     }
 
-    // Conseils box
+    // Conseils box (opaque: it covers the params/strategy boxes while shown)
     if (advice.show) {
         const SDL_Rect box = L.adviceBox;
-        drawBox(r, box, "Conseils de l'IA", font);
+        setColor(r, {24, 19, 13, 255});
+        SDL_RenderFillRect(r, &box);
+        setColor(r, {120, 104, 82, 255});
+        SDL_RenderDrawRect(r, &box);
+        renderText(r, font, "Conseils de l'IA", box.x + 10, box.y + 5, kGold);
         // close button (X)
         setColor(r, {140, 60, 60, 255});
         SDL_RenderFillRect(r, &L.adviceClose);
@@ -625,38 +841,63 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
                  L.adviceClose.y + L.adviceClose.h - 5);
         drawLine(r, L.adviceClose.x + L.adviceClose.w - 5, L.adviceClose.y + 5, L.adviceClose.x + 5,
                  L.adviceClose.y + L.adviceClose.h - 5);
-        if (advice.busy) {
-            renderText(r, small, "Calcul en cours...", box.x + 10, box.y + 30, kTextDim);
-        } else if (analysisMode == 2) {
-            const size_t n = std::min<size_t>(advice.placements.size(), 6);
-            yy = box.y + 30;
-            for (size_t i = 0; i < n; ++i) {
-                const auto& rec = advice.placements[i];
-                char line[48];
-                std::snprintf(line, sizeof line, "#%d  Bloc -> (%d,%d)",
-                              static_cast<int>(i) + 1, rec.cell.x, rec.cell.y);
-                setColor(r, kAdvicePalette[i % 8]);
-                fillCircle(r, box.x + 18, yy + 8, 6);
-                renderText(r, small, line, box.x + 30, yy, kTextColor);
-                yy += 19;
-            }
-        } else if (advice.moves.empty()) {
-            renderText(r, small, "Calcul en cours...", box.x + 10, box.y + 30, kTextDim);
+        // engine controls: budget - / value / + / Relancer / Arreter|Reprendre
+        const EngineControls c = engineControlRects(box);
+        drawSmallButton(r, small, c.minus.x, c.minus.y, c.minus.w, c.minus.h, "-", false);
+        drawSmallButton(r, small, c.plus.x, c.plus.y, c.plus.w, c.plus.h, "+", false);
+        renderCentered(r, small, fmtMs(advice.engineBaseMs), box.x + 66, c.minus.y + 11, kGold);
+        drawSmallButton(r, small, c.relancer.x, c.relancer.y, c.relancer.w, c.relancer.h,
+                        "Relancer", false);
+        drawSmallButton(r, small, c.stop.x, c.stop.y, c.stop.w, c.stop.h,
+                        advice.engineActive ? "Arreter" : "Reprendre", advice.engineActive);
+        // status line
+        char status[96];
+        if (advice.engineActive) {
+            std::snprintf(status, sizeof status, "Analyse en direct : etape %lld (%s)",
+                          static_cast<long long>(advice.engineStep), fmtMs(advice.engineStepMs).c_str());
         } else {
-            const size_t n = std::min<size_t>(advice.moves.size(), 6);
-            yy = box.y + 30;
-            for (size_t i = 0; i < n; ++i) {
-                const auto& rec = advice.moves[i];
-                const int pct = movePct(game, rec.value);
-                char line[48];
-                std::snprintf(line, sizeof line, "#%d  P%d -> (%d,%d)  %d%%", static_cast<int>(i) + 1,
-                              rec.move.pawn + 1, rec.move.dest.x, rec.move.dest.y, pct);
-                // rank swatch
-                setColor(r, kAdvicePalette[i % 8]);
-                fillCircle(r, box.x + 18, yy + 8, 6);
-                renderText(r, small, line, box.x + 30, yy, kTextColor);
-                yy += 19;
+            std::snprintf(status, sizeof status, "Analyse arretee — Relancer pour reprendre");
+        }
+        renderText(r, small, status, box.x + 10, box.y + 56, kTextDim);
+        // scenarios: action + sim count, then per-player win shares
+        const size_t n = std::min<size_t>(advice.scenarios.size(), 4);
+        yy = box.y + 76;
+        for (size_t i = 0; i < n; ++i) {
+            const auto& sv = advice.scenarios[i];
+            char line[64];
+            if (sv.isPlacement) {
+                std::snprintf(line, sizeof line, "#%d  Bloc -> (%d,%d)", static_cast<int>(i) + 1,
+                              sv.cell.x, sv.cell.y);
+            } else {
+                std::snprintf(line, sizeof line, "#%d  P%d -> (%d,%d)", static_cast<int>(i) + 1,
+                              sv.move.pawn + 1, sv.move.dest.x, sv.move.dest.y);
             }
+            setColor(r, kAdvicePalette[i % 8]);
+            fillCircle(r, box.x + 18, yy + 8, 6);
+            renderText(r, small, line, box.x + 30, yy, kTextColor);
+            const long long sims = sv.isPlacement ? sv.sims : sv.visits;
+            std::snprintf(line, sizeof line, "%s sims", groupThousands(sims).c_str());
+            renderText(r, small, line, box.x + box.w - 118, yy, kTextDim);
+            // per-player simulated win shares for this move
+            yy += 15;
+            int x = box.x + 30;
+            for (int p = 0; p < game.playerCount(); ++p) {
+                const int sh = !sv.shares.empty()
+                                   ? static_cast<int>(std::lround(sv.shares[p] * 100.0))
+                                   : -1;
+                char t[24];
+                if (sh < 0) {
+                    std::snprintf(t, sizeof t, "%s ?", kPlayerShorts[p]);
+                } else {
+                    std::snprintf(t, sizeof t, "%s %d%%", kPlayerShorts[p], sh);
+                }
+                renderText(r, small, t, x, yy, p == game.currentPlayer() ? kGold : kPlayerColors[p]);
+                x += 42;
+            }
+            yy += 13;
+        }
+        if (advice.scenarios.empty()) {
+            renderText(r, small, "Recherche en cours...", box.x + 10, yy, kTextDim);
         }
     }
 
@@ -665,9 +906,9 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
                kWinH - 26, kTextDim);
 }
 
-void drawBoard(SDL_Renderer* r, TTF_Font* font, SDL_Texture* wood, const barricade::Game& game,
-               int selectedPawn, int hoverPawn, bool showHints, const std::string& msg,
-               const Anim& anim, barricade::Point lastMove, Uint32 lastMoveAt,
+void drawBoard(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, SDL_Texture* wood,
+               const barricade::Game& game, int selectedPawn, int hoverPawn, bool showHints,
+               const std::string& msg, const Anim& anim, barricade::Point lastMove, Uint32 lastMoveAt,
                const AdviceView& advice, bool adviceMatch) {
     // wood table covering everything below the status bar
     drawTexture(r, wood, 0, kStatusH, kWinW, kWinH - kStatusH);
@@ -835,10 +1076,10 @@ void drawBoard(SDL_Renderer* r, TTF_Font* font, SDL_Texture* wood, const barrica
         fillCircle(r, 22, kStatusH / 2, 9);
         drawRing(r, 22, kStatusH / 2, 13, {255, 255, 255, 120});
         const std::string turnText = std::string("Tour : ") + kPlayerNames[cur];
-        renderText(r, font, turnText, 40, 6, kTextColor);
-        if (!msg.empty()) renderText(r, font, msg, 40, 24, {255, 200, 90, 255});
+        renderText(r, font, turnText, 40, 4, kTextColor);
+        if (!msg.empty()) renderText(r, small, msg, 40, 32, {255, 200, 90, 255});
 
-        const SDL_Rect die{kWinW - 56, 6, 36, 36};
+        const SDL_Rect die{kWinW - 56, 8, 36, 36};
         setColor(r, {245, 245, 245, 255});
         SDL_RenderFillRect(r, &die);
         setColor(r, {90, 90, 90, 255});
@@ -1005,6 +1246,36 @@ int main(int argc, char* argv[]) {
     std::vector<barricade::BarricadeRecommendation> advicePlaceResult;
     int adviceMode = 0;  // mode of the in-flight computation
     uint64_t adviceSig = 0;
+
+    // Live analysis engine: one persistent thread. The overlay is driven by
+    // its deepening sessions; the UI thread never joins it while it runs.
+    AnalysisEngine engine;
+    engine.snapshot = game;
+    engine.th = std::thread(engineLoop, std::ref(engine));
+    uint64_t engineSig = 0;
+    int engineMode = 0;
+
+    const auto engineStart = [&](int mode) {
+        std::lock_guard<std::mutex> guard(engine.m);
+        engine.snapshot = game;
+        engine.mode = mode;
+        engine.sig = posSig(game);
+        engine.scenarios.clear();
+        engine.restart.store(false);
+        engine.requestStop.store(false);
+        engine.want.store(true);
+        engine.cv.notify_one();
+    };
+    const auto engineStop = [&] { engine.requestStop.store(true); };
+    const auto engineSync = [&] {
+        std::lock_guard<std::mutex> guard(engine.m);
+        advice.scenarios = engine.scenarios;
+        advice.engineStepMs = engine.stepMs.load();
+        advice.engineStep = engine.step.load();
+        advice.engineBaseMs = engine.baseMs.load();
+        advice.engineActive = engine.running.load();
+    };
+
     const auto launchAnalysis = [&](int mode) {
         if (adviceBusy) return;
         adviceMode = mode;
@@ -1031,6 +1302,8 @@ int main(int argc, char* argv[]) {
         advice.show = false;
         advice.moves.clear();
         advice.placements.clear();
+        advice.scenarios.clear();
+        engineStop();
     };
     const auto toggleAdvice = [&] {
         if (advice.show) {
@@ -1045,8 +1318,9 @@ int main(int argc, char* argv[]) {
     // which gives a finer win estimate than the static race heuristic.
     struct SimRun {
         std::atomic<bool> stop{true};
+        std::atomic<bool> paused{true};
         std::atomic<long long> games{0};
-        std::vector<std::atomic<long long>> wins;
+        std::array<std::atomic<long long>, barricade::kMaxPlayers> wins{};
         std::thread th;
         uint64_t sig = 0;
     };
@@ -1057,18 +1331,42 @@ int main(int argc, char* argv[]) {
         if (simRun.th.joinable()) simRun.th.join();
         simRun.sig = sig;
         simRun.games.store(0);
-        simRun.wins.clear();
-        for (int p = 0; p < game.playerCount(); ++p) simRun.wins.emplace_back(0);
+        for (int p = 0; p < game.playerCount(); ++p) simRun.wins[p].store(0);
         const barricade::Game snapshot = game;
         simRun.stop.store(false);
         simRun.th = std::thread([snapshot, &simRun] {
-            barricade::simulateWinChancesAsync(snapshot, 1000000000LL, &simRun.stop, &simRun.wins,
+            barricade::simulateWinChancesAsync(snapshot, 1000000000LL, &simRun.stop,
+                                               simRun.wins.data(), snapshot.playerCount(),
                                                &simRun.games, 0);
         });
     };
     const auto stopSim = [&] {
         simRun.stop.store(true);
         if (simRun.th.joinable()) simRun.th.join();
+    };
+    // Resume without resetting the accumulated games when the position is
+    // unchanged (used by the Pause/Lancer toggle).
+    const auto resumeSim = [&] {
+        const barricade::Game snapshot = game;
+        simRun.stop.store(false);
+        simRun.th = std::thread([snapshot, &simRun] {
+            barricade::simulateWinChancesAsync(snapshot, 1000000000LL, &simRun.stop,
+                                               simRun.wins.data(), snapshot.playerCount(),
+                                               &simRun.games, 0);
+        });
+    };
+    const auto toggleSim = [&] {
+        if (simRun.paused.load()) {
+            simRun.paused.store(false);
+            if (posSig(game) != simRun.sig) {
+                startSim(posSig(game));  // position changed while paused: restart
+            } else {
+                resumeSim();             // same position: keep counting
+            }
+        } else {
+            simRun.paused.store(true);
+            stopSim();
+        }
     };
 
     bool running = true;
@@ -1154,7 +1452,7 @@ int main(int argc, char* argv[]) {
             } else if (e.type == SDL_MOUSEBUTTONDOWN) {
                 const int mx = e.button.x, my = e.button.y;
                 const int cur = game.currentPlayer();
-                const PanelLayout L = panelLayout();
+    const PanelLayout L = panelLayout(advice.show);
                 const auto inRect = [&](const SDL_Rect& rc) {
                     return mx >= rc.x && mx < rc.x + rc.w && my >= rc.y && my < rc.y + rc.h;
                 };
@@ -1167,10 +1465,39 @@ int main(int argc, char* argv[]) {
 
                 // panel interactions
                 if (mx >= kPanelX) {
-                    if (!isAi(cur) && !game.isOver() && inRect(L.adviseBtn)) {
+                    // Pause / Lancer toggle for the end-game simulation (gains box)
+                    const SDL_Rect simBtn{kPanelX + kPanelW - kPanelPad - 66, kStatusH + 354, 58, 20};
+                    if (!game.isOver() && inRect(simBtn)) {
+                        toggleSim();
+                    } else if (!isAi(cur) && !game.isOver() && inRect(L.adviseBtn)) {
                         toggleAdvice();
-                    } else if (advice.show && !advice.busy && inRect(L.adviceClose)) {
+                    } else if (advice.show && inRect(L.adviceClose)) {
                         closeAdvice();
+                    } else if (advice.show && !game.isOver()) {
+                        // live-analysis controls: budget / relancer / pause
+                        const EngineControls c = engineControlRects(L.adviceBox);
+                        if (inRect(c.minus)) {
+                            double b = engine.baseMs.load();
+                            engine.baseMs.store(b > 250.0 ? b / 2.0 : 250.0);
+                            engine.restart.store(true);
+                        } else if (inRect(c.plus)) {
+                            double b = engine.baseMs.load();
+                            engine.baseMs.store(b < 4000.0 ? b * 2.0 : 4000.0);
+                            engine.restart.store(true);
+                        } else if (inRect(c.relancer)) {
+                            engineStop();
+                            engine.restart.store(false);
+                            engine.want.store(true);
+                            engine.cv.notify_one();
+                        } else if (inRect(c.stop)) {
+                            if (engine.running.load()) {
+                                engineStop();
+                            } else {
+                                engine.restart.store(false);
+                                engine.want.store(true);
+                                engine.cv.notify_one();
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1314,23 +1641,47 @@ int main(int argc, char* argv[]) {
             const int wantMode = game.pendingBarricade() ? 2 : 1;
 
             // keep the end-game simulation fresh for the current position
+            // (unless the user has paused it)
             if (game.isOver()) {
                 stopSim();
-            } else if (sig != simRun.sig) {
+            } else if (!simRun.paused.load() && sig != simRun.sig) {
                 startSim(sig);
             }
 
-            // auto-analyse the current position on a human turn
+            // the overlay is dismissed when it can no longer apply
+            if (game.isOver() || isAi(game.currentPlayer())) advice.show = false;
+
             const bool humanPhase =
                 !game.isOver() && !isAi(game.currentPlayer()) && game.dice() > 0;
-            if (humanPhase && !adviceBusy &&
+
+            // The live engine drives the overlay; the auto-analysis only runs
+            // when the overlay is closed. While the overlay stays open the
+            // engine keeps deepening the same position (it only stops on
+            // demand: X, C, or closing via the AI turn / game over).
+            if (humanPhase && advice.show) {
+                if (engineSig != sig || engineMode != wantMode) {
+                    engineStart(wantMode);
+                    engineSig = sig;
+                    engineMode = wantMode;
+                }
+            } else if (!advice.show && (engine.want.load() || engine.running.load())) {
+                engineStop();
+            }
+            engineSync();
+
+            // auto-analyse the current position on a human turn
+            if (humanPhase && !advice.show && !adviceBusy &&
                 (adviceSig != sig || adviceMode != wantMode)) {
                 launchAnalysis(wantMode);
             }
 
             // the overlay only shows when the analysis matches the board
-            const bool adviceMatch = !adviceBusy && adviceSig == sig && adviceMode == wantMode;
-            if (game.isOver() || isAi(game.currentPlayer())) advice.show = false;
+            bool adviceMatch;
+            if (advice.show) {
+                adviceMatch = engineSig == sig && engineMode == wantMode;
+            } else {
+                adviceMatch = !adviceBusy && adviceSig == sig && adviceMode == wantMode;
+            }
 
             // hover hints: reachable cells under the mouse (human turn only)
             int hoverPawn = -1;
@@ -1358,10 +1709,11 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
-            drawBoard(renderer, font, wood, game, selectedPawn, hoverPawn, showHints, msg, anim,
+            drawBoard(renderer, font, small, wood, game, selectedPawn, hoverPawn, showHints, msg, anim,
                       lastMove, lastMoveAt, advice, adviceMatch);
             drawPanel(renderer, font, small, game, advice, barricade::mctsInfo(), lastAiText,
-                      humanTurn, adviceMatch, adviceMode, simGames, simShares);
+                      humanTurn, adviceMatch, adviceMode, simGames, simShares,
+                      simRun.paused.load());
         } else {
             drawMenu(renderer, titleFont, font, wood, mouseX, mouseY, menuPlayers, menuHumans);
         }
@@ -1372,6 +1724,10 @@ int main(int argc, char* argv[]) {
     if (aiBusy) aiThread.join();
     if (adviceBusy) adviceThread.join();
     stopSim();
+    engineStop();
+    engine.exit.store(true);
+    engine.cv.notify_all();
+    if (engine.th.joinable()) engine.th.join();
 
     if (wood) SDL_DestroyTexture(wood);
     if (titleFont && titleFont != font) TTF_CloseFont(titleFont);
