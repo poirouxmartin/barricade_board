@@ -28,7 +28,7 @@ struct MctsRecommendation {
 };
 std::vector<MctsRecommendation> mctsRecommendations(const Game& game, int player, int budgetMs);
 
-// Per-action statistics of the shared-tree search root.
+// Per-action statistics of the root-parallel MCTS search (merged across workers).
 struct ActionStats {
     AIMove move;
     long long visits = 0;

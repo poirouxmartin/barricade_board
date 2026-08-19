@@ -277,66 +277,65 @@ double rollout(const Game& g0, int rootPlayer, std::mt19937& rng) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared-tree MCTS. All worker threads traverse ONE tree, so each node is
-// visited many more times than in a per-thread tree. Virtual loss keeps the
-// threads from piling onto the same node while it is being expanded.
+// Root-parallel MCTS. Each worker builds its OWN tree (no shared memory, no
+// virtual loss, no atomics), so workers scale almost linearly; the root
+// children statistics are merged once the threads have joined.
 // ---------------------------------------------------------------------------
 
-struct SharedNode;
-struct SharedLink;
+struct TreeNode;
+struct TreeLink;
 
-struct SharedNode {
-    explicit SharedNode(Game&& g) : game(std::move(g)) {}
+struct TreeNode {
+    explicit TreeNode(Game&& g) : game(std::move(g)) {}
     Game game;
     int player = 0;
-    std::atomic<long long> visits{0};
-    std::atomic<double> score{0.0};
-    std::atomic<int> expandLock{0};
-    std::atomic<bool> ready{false};
-    std::atomic<size_t> nextAction{0};
-    std::atomic<SharedLink*> children{nullptr};
+    long long visits = 0;
+    double score = 0.0;
+    bool expanded = false;
+    size_t nextAction = 0;
     std::vector<AIMove> actions;
+    TreeLink* children = nullptr;
 };
 
-struct SharedLink {
+struct TreeLink {
     AIMove action;
-    SharedNode* node;
-    SharedLink* next;
+    TreeNode* node;
+    TreeLink* next;
 };
 
-// Nodes/links a worker allocated; kept alive until the worker is joined
-// because the pointers are shared through the tree. They come from per-thread
-// arenas (big aligned blocks) so workers don't contend on malloc.
-struct ThreadResult {
+// Nodes/links a worker allocated; kept alive until the worker is joined.
+// They come from per-thread arenas (big aligned blocks) so workers don't
+// contend on malloc.
+struct Worker {
     static constexpr size_t kNodeBlock = 1024;
-    struct alignas(SharedNode) NodeBlock {
-        char data[kNodeBlock * sizeof(SharedNode)];
+    struct alignas(TreeNode) NodeBlock {
+        char data[kNodeBlock * sizeof(TreeNode)];
     };
     static constexpr size_t kLinkBlock = 8192;
-    struct alignas(SharedLink) LinkBlock {
-        char data[kLinkBlock * sizeof(SharedLink)];
+    struct alignas(TreeLink) LinkBlock {
+        char data[kLinkBlock * sizeof(TreeLink)];
     };
 
-    SharedNode* allocNode(Game&& g) {
+    TreeNode* allocNode(Game&& g) {
         if (nodesLeft == 0) {
             nodeBlocks.emplace_back(std::make_unique<NodeBlock>());
-            nodeCursor = reinterpret_cast<SharedNode*>(nodeBlocks.back().get());
+            nodeCursor = reinterpret_cast<TreeNode*>(nodeBlocks.back().get());
             nodesLeft = kNodeBlock;
         }
-        SharedNode* p = nodeCursor++;
+        TreeNode* p = nodeCursor++;
         --nodesLeft;
         ++nodeConstructed;
-        new (p) SharedNode(std::move(g));
+        new (p) TreeNode(std::move(g));
         return p;
     }
 
-    SharedLink* allocLink(AIMove mv, SharedNode* node, SharedLink* next) {
+    TreeLink* allocLink(AIMove mv, TreeNode* node, TreeLink* next) {
         if (linksLeft == 0) {
             linkBlocks.emplace_back(std::make_unique<LinkBlock>());
-            linkCursor = reinterpret_cast<SharedLink*>(linkBlocks.back().get());
+            linkCursor = reinterpret_cast<TreeLink*>(linkBlocks.back().get());
             linksLeft = kLinkBlock;
         }
-        SharedLink* p = linkCursor++;
+        TreeLink* p = linkCursor++;
         --linksLeft;
         ++linkConstructed;
         p->action = mv;
@@ -345,23 +344,23 @@ struct ThreadResult {
         return p;
     }
 
-    ~ThreadResult() {
+    ~Worker() {
         size_t full = nodeConstructed / kNodeBlock;
         size_t rem = nodeConstructed % kNodeBlock;
         for (size_t i = 0; i < full; ++i) {
-            SharedNode* base = reinterpret_cast<SharedNode*>(nodeBlocks[i].get());
-            for (size_t j = 0; j < kNodeBlock; ++j) base[j].~SharedNode();
+            TreeNode* base = reinterpret_cast<TreeNode*>(nodeBlocks[i].get());
+            for (size_t j = 0; j < kNodeBlock; ++j) base[j].~TreeNode();
         }
         if (rem != 0) {
-            SharedNode* base = reinterpret_cast<SharedNode*>(nodeBlocks[full].get());
-            for (size_t j = 0; j < rem; ++j) base[j].~SharedNode();
+            TreeNode* base = reinterpret_cast<TreeNode*>(nodeBlocks[full].get());
+            for (size_t j = 0; j < rem; ++j) base[j].~TreeNode();
         }
     }
 
     std::vector<std::unique_ptr<NodeBlock>> nodeBlocks;
     std::vector<std::unique_ptr<LinkBlock>> linkBlocks;
-    SharedNode* nodeCursor = nullptr;
-    SharedLink* linkCursor = nullptr;
+    TreeNode* nodeCursor = nullptr;
+    TreeLink* linkCursor = nullptr;
     size_t nodesLeft = 0;
     size_t linksLeft = 0;
     size_t nodeConstructed = 0;
@@ -369,16 +368,11 @@ struct ThreadResult {
     long long iterations = 0;
 };
 
-constexpr double kVirtualLoss = 1.0;
 std::atomic<long long> g_nodeCount{0};
 std::atomic<long long> g_iterations{0};
 
-// Builds the node's action list exactly once. Returns true if *this* thread
-// did the build (then `ready` is set with release ordering).
-bool expandNode(SharedNode* n) {
-    if (n->ready.load(std::memory_order_acquire)) return true;
-    int expected = 0;
-    if (!n->expandLock.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) return false;
+// Builds the node's action list exactly once (the tree is private, no lock).
+void expandNode(TreeNode* n) {
     Point dests[512];
     char seen[kCols * kRows];
     for (int m = 0; m < kPawnsPerPlayer; ++m) {
@@ -387,12 +381,10 @@ bool expandNode(SharedNode* n) {
         for (int i = 0; i < cnt; ++i) n->actions.push_back({m, dests[i]});
     }
     if (n->actions.empty()) n->actions.push_back(AIMove{});  // skip pseudo-action
-    n->ready.store(true, std::memory_order_release);
-    return true;
+    n->expanded = true;
 }
 
-SharedNode* createChildShared(SharedNode* n, const AIMove& mv, std::mt19937& rng,
-                              ThreadResult& res) {
+TreeNode* createChild(TreeNode* n, const AIMove& mv, std::mt19937& rng, Worker& w) {
     Game g = n->game;
     if (mv.pawn >= 0) {
         if (!g.movePawn(n->player, mv.pawn, mv.dest)) return nullptr;
@@ -404,39 +396,83 @@ SharedNode* createChildShared(SharedNode* n, const AIMove& mv, std::mt19937& rng
     }
     g.forceDice(1 + rng() % 6);
 
-    SharedNode* child = res.allocNode(std::move(g));
+    TreeNode* child = w.allocNode(std::move(g));
     child->player = child->game.currentPlayer();
     return child;
 }
 
-void publishChild(SharedNode* n, SharedNode* child, const AIMove& mv, ThreadResult& res) {
-    SharedLink* link = res.allocLink(mv, child, nullptr);
-    SharedLink* head = n->children.load(std::memory_order_acquire);
-    do {
-        link->next = head;
-    } while (!n->children.compare_exchange_weak(head, link, std::memory_order_release,
-                                                std::memory_order_acquire));
+void publish(TreeNode* n, TreeNode* child, const AIMove& mv, Worker& w) {
+    TreeLink* link = w.allocLink(mv, child, n->children);
+    n->children = link;
 }
 
-SharedNode* uctSelectShared(SharedNode* n) {
-    const long long nv = n->visits.load(std::memory_order_acquire);
-    const double logNv = std::log(static_cast<double>(nv) + 1.0);
-    SharedNode* best = nullptr;
+TreeNode* uctSelect(TreeNode* n) {
+    const long long nv = n->visits;
+    const double base = kUctC * std::sqrt(std::log(static_cast<double>(nv) + 1.0));
+    TreeNode* best = nullptr;
     double bestUct = -1.0;
-    const double base = kUctC * std::sqrt(logNv);  // exploration weight, per selection
-    for (SharedLink* l = n->children.load(std::memory_order_acquire); l; l = l->next) {
-        SharedNode* c = l->node;
+    for (TreeLink* l = n->children; l; l = l->next) {
+        TreeNode* c = l->node;
         if (!c) continue;
-        const long long cv = c->visits.load(std::memory_order_acquire);
-        if (cv == 0) return c;
-        const double cs = c->score.load(std::memory_order_relaxed);
-        const double uct = cs / cv + base / std::sqrt(static_cast<double>(cv));
+        const long long cv = c->visits;
+        if (cv == 0) return c;  // visit every child once before exploiting
+        const double uct = c->score / cv + base / std::sqrt(static_cast<double>(cv));
         if (uct > bestUct) {
             bestUct = uct;
             best = c;
         }
     }
     return best;
+}
+
+// One worker's search on its private tree, until the shared deadline.
+void treeSearch(TreeNode* root, int player,
+                std::chrono::steady_clock::time_point start, int budgetMs, Worker& w) {
+    std::mt19937 rng(std::random_device{}());
+    const auto deadline = start + std::chrono::milliseconds(budgetMs);
+    std::vector<TreeNode*> path;
+    long long iter = 0;
+    while (iter < kMaxIterations) {
+        if ((iter & 63) == 0 && std::chrono::steady_clock::now() > deadline) break;
+        path.clear();
+
+        TreeNode* n = root;
+        while (n->expanded && n->nextAction >= n->actions.size()) {
+            TreeNode* c = uctSelect(n);
+            if (!c) break;
+            n = c;
+            path.push_back(n);
+        }
+        if (!n->expanded) expandNode(n);
+
+        double v;
+        if (n->nextAction < n->actions.size()) {
+            const size_t idx = n->nextAction++;
+            TreeNode* child = createChild(n, n->actions[idx], rng, w);
+            if (!child) {  // movePawn rejected a supposedly legal move
+                ++iter;
+                continue;
+            }
+            publish(n, child, n->actions[idx], w);
+            v = rollout(child->game, player, rng);
+            child->visits = 1;
+            child->score = v;
+            for (TreeNode* p : path) {
+                p->visits++;
+                p->score += v;
+            }
+        } else {
+            v = heuristicEval(n->game, player);
+            for (TreeNode* p : path) {
+                p->visits++;
+                p->score += v;
+            }
+        }
+        root->visits++;
+        root->score += v;
+        ++iter;
+    }
+    w.iterations = iter;
 }
 
 }  // namespace
@@ -499,99 +535,10 @@ AIMove pickBest(const std::vector<ActionStats>& stats, const Game& game, int pla
     return best;
 }
 
-// One worker's share of the shared-tree search, running until the shared
-// deadline so every thread stops at the same moment.
-void sharedSearchLoop(SharedNode* root, int player,
-                      std::chrono::steady_clock::time_point start, int budgetMs,
-                      ThreadResult& res) {
-    std::mt19937 rng(std::random_device{}());
-    const auto deadline = start + std::chrono::milliseconds(budgetMs);
-    std::vector<SharedNode*> path;
-    long long iter = 0;
-    long long rootVisits = 0;  // each completed iteration adds 2 visits to the root
-    double rootScore = 0.0;     // accumulates the returned values of the batch
-    while (iter < kMaxIterations) {
-        if ((iter & 31) == 0) {
-            if (std::chrono::steady_clock::now() > deadline) break;
-            if (iter > 0) {  // flush the batch, amortizing root contention
-                root->visits.fetch_add(rootVisits, std::memory_order_relaxed);
-                root->score.fetch_add(rootScore, std::memory_order_relaxed);
-                rootVisits = 0;
-                rootScore = 0.0;
-            }
-        }
-
-        path.push_back(root);
-
-        SharedNode* n = root;
-        double v = 0.0;
-        bool aborted = false;
-        while (true) {
-            if (!n->ready.load(std::memory_order_acquire)) {
-                if (!expandNode(n)) {
-                    std::this_thread::yield();
-                    continue;
-                }
-            }
-            const size_t idx = n->nextAction.fetch_add(1, std::memory_order_relaxed);
-            if (idx < n->actions.size()) {
-                SharedNode* child = createChildShared(n, n->actions[idx], rng, res);
-                if (!child) {
-                    // movePawn rejected a supposedly legal move: undo the
-                    // virtual losses applied along the descent and restart.
-                    for (size_t i = 1; i < path.size(); ++i) {
-                        SharedNode* p = path[i];
-                        p->score.fetch_add(kVirtualLoss, std::memory_order_relaxed);
-                    }
-                    path.clear();
-                    aborted = true;
-                    break;
-                }
-                publishChild(n, child, n->actions[idx], res);
-                v = rollout(child->game, player, rng);
-                child->visits.fetch_add(1, std::memory_order_relaxed);
-                child->score.fetch_add(v, std::memory_order_relaxed);
-                break;
-            }
-            SharedNode* c = uctSelectShared(n);
-            if (!c) {
-                v = heuristicEval(n->game, player);
-                break;
-            }
-            n = c;
-            // Virtual loss on the score only: the visit increment is folded
-            // into the backup below (+2), halving the RMW traffic on the hot
-            // shared nodes. The score drop still deters other workers.
-            n->score.fetch_add(-kVirtualLoss, std::memory_order_relaxed);
-            path.push_back(n);
-        }
-
-        if (!aborted) {
-            // Path index 0 is the root, whose own stats are never read for
-            // selection; updating it per-iteration would serialize all threads
-            // on one cache line. The amortized batch below covers it instead.
-            for (size_t i = 1; i < path.size(); ++i) {
-                SharedNode* p = path[i];
-                // +2 visits: +1 from the descent (virtual visit) folded here,
-                // +1 from this iteration's real visit.
-                p->visits.fetch_add(2, std::memory_order_relaxed);
-                p->score.fetch_add(v + kVirtualLoss, std::memory_order_relaxed);
-            }
-            rootVisits += 2;
-            rootScore += v;
-        }
-        path.clear();
-        ++iter;
-    }
-    root->visits.fetch_add(rootVisits, std::memory_order_relaxed);
-    root->score.fetch_add(rootScore, std::memory_order_relaxed);
-    res.iterations = iter;
-}
-
 }  // namespace
 
-// Shared-tree MCTS: all workers traverse one tree; the root children's
-// statistics are read back once the threads have joined.
+// Root-parallel MCTS: every worker searches its own tree from the same root
+// position; the root children statistics are summed across workers.
 std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budgetMs,
                                          int nThreads) {
     if (game.dice() <= 0 || game.isOver()) return {};
@@ -600,39 +547,58 @@ std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budge
     if (nThreads < 1) nThreads = 1;
     if (nThreads > 16) nThreads = 16;
 
-    auto root = std::make_unique<SharedNode>(Game(game));
-    root->player = root->game.currentPlayer();
     g_iterations.store(0, std::memory_order_relaxed);
-
     const auto start = std::chrono::steady_clock::now();
 
-    std::vector<ThreadResult> results(nThreads);
+    std::vector<std::unique_ptr<Worker>> workers(nThreads);
+    std::vector<TreeNode*> roots(nThreads);
+    for (int t = 0; t < nThreads; ++t) {
+        workers[t] = std::make_unique<Worker>();
+        roots[t] = workers[t]->allocNode(Game(game));
+        roots[t]->player = roots[t]->game.currentPlayer();
+    }
+
     if (nThreads == 1) {
-        sharedSearchLoop(root.get(), player, start, budgetMs, results[0]);
+        treeSearch(roots[0], player, start, budgetMs, *workers[0]);
     } else {
         std::vector<std::thread> threads;
         threads.reserve(nThreads);
         for (int t = 0; t < nThreads; ++t) {
             threads.emplace_back(
-                [&, t] { sharedSearchLoop(root.get(), player, start, budgetMs, results[t]); });
+                [&, t] { treeSearch(roots[t], player, start, budgetMs, *workers[t]); });
         }
         for (std::thread& th : threads) th.join();
     }
 
     long long totalIter = 0;
-    long long totalNodes = 1;  // root
-    for (const ThreadResult& r : results) {
-        totalIter += r.iterations;
-        totalNodes += r.nodeConstructed;
+    long long totalNodes = 0;
+    for (int t = 0; t < nThreads; ++t) {
+        totalIter += workers[t]->iterations;
+        totalNodes += workers[t]->nodeConstructed;
     }
     g_iterations.store(totalIter, std::memory_order_relaxed);
-    g_nodeCount.store(totalNodes, std::memory_order_relaxed);
+    g_nodeCount.store(totalNodes + nThreads, std::memory_order_relaxed);  // + roots
 
+    // Merge the root children statistics across all workers.
     std::vector<ActionStats> out;
-    for (SharedLink* l = root->children.load(std::memory_order_acquire); l; l = l->next) {
-        if (!l->node || l->node->visits.load(std::memory_order_relaxed) <= 0) continue;
-        out.push_back({l->action, l->node->visits.load(std::memory_order_relaxed),
-                       l->node->score.load(std::memory_order_relaxed)});
+    for (int t = 0; t < nThreads; ++t) {
+        for (TreeLink* l = roots[t]->children; l; l = l->next) {
+            if (!l->node || l->node->visits <= 0) continue;
+            ActionStats* slot = nullptr;
+            for (ActionStats& s : out) {
+                if (s.move.pawn == l->action.pawn && s.move.dest.x == l->action.dest.x &&
+                    s.move.dest.y == l->action.dest.y) {
+                    slot = &s;
+                    break;
+                }
+            }
+            if (!slot) {
+                out.push_back({l->action, 0, 0.0});
+                slot = &out.back();
+            }
+            slot->visits += l->node->visits;
+            slot->score += l->node->score;
+        }
     }
     return out;
 }
