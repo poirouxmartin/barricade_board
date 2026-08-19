@@ -41,6 +41,22 @@ std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budge
 long long mctsIterationCount();
 long long mctsNodeCount();
 
+// Diagnostics of the last completed MCTS search (AI move or advice request).
+struct SearchInfo {
+    long long iterations = 0;
+    long long nodes = 0;
+    double elapsedMs = 0.0;
+    double avgDepth = 0.0;
+    double winProb = 0.0;  // current player's win probability for the best move
+};
+SearchInfo mctsInfo();
+
+// Static heuristic: each player's minimum distance to the goal (kInf if blocked).
+std::vector<int> playerProgress(const Game& game);
+
+// Estimated win probabilities per player (normalized so they sum to 1).
+std::vector<double> winChances(const Game& game);
+
 // Greedy heuristic: picks a barricade placement that slows opponents
 // down the most while hurting the current player the least.
 Point naiveBarricadePlacement(const Game& game);

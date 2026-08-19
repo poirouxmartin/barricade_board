@@ -366,10 +366,14 @@ struct Worker {
     size_t nodeConstructed = 0;
     size_t linkConstructed = 0;
     long long iterations = 0;
+    long long depthSum = 0;
 };
 
 std::atomic<long long> g_nodeCount{0};
 std::atomic<long long> g_iterations{0};
+std::atomic<long long> g_elapsedUs{0};
+std::atomic<double> g_avgDepth{0.0};
+std::atomic<double> g_winProb{0.0};
 
 // Builds the node's action list exactly once (the tree is private, no lock).
 void expandNode(TreeNode* n) {
@@ -461,6 +465,7 @@ void treeSearch(TreeNode* root, int player,
                 p->visits++;
                 p->score += v;
             }
+            w.depthSum += path.size() + 1;  // depth of the new leaf
         } else {
             v = heuristicEval(n->game, player);
             for (TreeNode* p : path) {
@@ -572,12 +577,20 @@ std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budge
 
     long long totalIter = 0;
     long long totalNodes = 0;
+    long long depthSum = 0;
     for (int t = 0; t < nThreads; ++t) {
         totalIter += workers[t]->iterations;
         totalNodes += workers[t]->nodeConstructed;
+        depthSum += workers[t]->depthSum;
     }
     g_iterations.store(totalIter, std::memory_order_relaxed);
     g_nodeCount.store(totalNodes + nThreads, std::memory_order_relaxed);  // + roots
+    g_elapsedUs.store(std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count(),
+                      std::memory_order_relaxed);
+    g_avgDepth.store(totalIter > 0 ? static_cast<double>(depthSum) / totalIter : 0.0,
+                     std::memory_order_relaxed);
 
     // Merge the root children statistics across all workers.
     std::vector<ActionStats> out;
@@ -600,6 +613,21 @@ std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budge
             slot->score += l->node->score;
         }
     }
+
+    // Best move = the one with the most visits; its value estimates the
+    // current player's win probability.
+    double bestProb = 0.5;
+    long long bestVisits = 0;
+    for (const ActionStats& s : out) {
+        if (s.visits > bestVisits) {
+            bestVisits = s.visits;
+            bestProb = (1.0 + s.score / s.visits) / 2.0;
+        }
+    }
+    if (bestProb < 0.0) bestProb = 0.0;
+    if (bestProb > 1.0) bestProb = 1.0;
+    g_winProb.store(bestProb, std::memory_order_relaxed);
+
     return out;
 }
 
@@ -611,6 +639,37 @@ AIMove mctsMove(const Game& game, int player, int budgetMs) {
 // `mctsActionStats` call.
 long long mctsIterationCount() { return g_iterations.load(std::memory_order_relaxed); }
 long long mctsNodeCount() { return g_nodeCount.load(std::memory_order_relaxed); }
+
+SearchInfo mctsInfo() {
+    return {g_iterations.load(std::memory_order_relaxed),
+            g_nodeCount.load(std::memory_order_relaxed),
+            static_cast<double>(g_elapsedUs.load(std::memory_order_relaxed)) / 1000.0,
+            g_avgDepth.load(std::memory_order_relaxed),
+            g_winProb.load(std::memory_order_relaxed)};
+}
+
+// Each player's minimum distance to the goal; pawns with no reachable path
+// report kInf.
+std::vector<int> playerProgress(const Game& game) {
+    std::vector<int> out(game.playerCount());
+    for (int p = 0; p < game.playerCount(); ++p) out[p] = progress(game, p);
+    return out;
+}
+
+// Estimated win probabilities per player from the static goal distances
+// (shorter distance = higher chance), normalized to sum to 1.
+std::vector<double> winChances(const Game& game) {
+    std::vector<double> out(game.playerCount());
+    double sum = 0.0;
+    for (int p = 0; p < game.playerCount(); ++p) {
+        int d = progress(game, p);
+        if (d > 30) d = 30;
+        out[p] = 1.0 / (d + 3.0);
+        sum += out[p];
+    }
+    for (double& v : out) v /= sum;
+    return out;
+}
 
 std::vector<MctsRecommendation> mctsRecommendations(const Game& game, int player, int budgetMs) {
     std::vector<MctsRecommendation> out;
