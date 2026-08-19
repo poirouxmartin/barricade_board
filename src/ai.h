@@ -65,4 +65,12 @@ Point naiveBarricadePlacement(const Game& game);
 // tree descent): no BFS, uses a static cell ranking instead.
 Point cheapBarricadePlacement(const Game& game);
 
+// Ranked barricade placements (best first) for the advice UI. `score` is the
+// raw gain-lose value; the caller normalizes it to a percentage.
+struct BarricadeRecommendation {
+    Point cell;
+    double score = 0.0;
+};
+std::vector<BarricadeRecommendation> barricadeRecommendations(const Game& game, int topN);
+
 }  // namespace barricade

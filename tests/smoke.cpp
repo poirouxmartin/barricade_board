@@ -143,6 +143,45 @@ check(g.placeBarricade(cells[0]), "barricade placed");
         check(g.barricadeAt(cells[0]), "barricade now at chosen cell");
     }
 
+    // The cell the capturing pawn just left is a valid placement target.
+    {
+        Game g(2);
+        g.movePawnFast(0, 0, {4, 12});  // red on track, above the bottom row
+        g.movePawnFast(1, 0, {6, 13});  // blue out
+        g.movePawnFast(0, 0, {4, 11});  // red lands on barricade (4,11) -> capture
+        check(g.pendingBarricade(), "barricade capture pending placement");
+        const auto cells = g.barricadePlacements();
+        check(has(cells, {4, 12}), "departure cell is a valid placement target");
+        check(g.placeBarricade({4, 12}), "barricade placed on the departure cell");
+    }
+
+    // The cell the capturing pawn landed on (now occupied) is forbidden.
+    {
+        Game g(2);
+        g.movePawnFast(0, 0, {4, 12});
+        g.movePawnFast(1, 0, {6, 13});
+        g.movePawnFast(0, 0, {4, 11});
+        check(g.pendingBarricade(), "pending placement");
+        check(!has(g.barricadePlacements(), {4, 11}), "occupied arrival cell is forbidden");
+    }
+
+    // Ranked barricade recommendations are legal and sorted best-first.
+    {
+        Game g(2);
+        g.movePawnFast(0, 0, {4, 12});
+        g.movePawnFast(1, 0, {6, 13});
+        g.movePawnFast(0, 0, {4, 11});  // capture barricade at (4,11)
+        check(g.pendingBarricade(), "pending barricade");
+        const auto recs = barricadeRecommendations(g, 6);
+        check(!recs.empty(), "barricade recommendations non-empty");
+        const auto cells = g.barricadePlacements();
+        for (size_t i = 0; i < recs.size(); ++i) {
+            check(has(cells, recs[i].cell), "recommended cell is legal");
+            if (i > 0) check(recs[i - 1].score >= recs[i].score, "recommendations sorted");
+        }
+        check(recs.size() <= 6, "recommendations capped at topN");
+    }
+
     // Naive AI returns a legal move for the current player.
     {
         Game g(2);

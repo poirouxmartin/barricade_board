@@ -158,7 +158,7 @@ bool Game::applyMove(int player, int pawn, Point dest) {
     if (over_ || player != current_) return false;
 
     const Point old = pawns_[player][pawn];
-    if (old.x >= 0) setPawn(old, 31);
+    if (old.x >= 0) setPawn(old, 255);
     for (int p = 0; p < player_count_; ++p) {
         if (p == player) continue;
         for (int m = 0; m < kPawnsPerPlayer; ++m) {

@@ -150,14 +150,30 @@ int progress(const Game& g, int player) {
 }
 
 double heuristicEval(const Game& g, int rootPlayer) {
-    int myMin = progress(g, rootPlayer);
+    int myMin = kInf;
     int oppMin = kInf;
-    for (int op = 0; op < g.playerCount(); ++op) {
-        if (op != rootPlayer) oppMin = std::min(oppMin, progress(g, op));
+    int myOut = 0;
+    int oppOut = 0;
+    for (int p = 0; p < g.playerCount(); ++p) {
+        int best = kInf;
+        for (int m = 0; m < kPawnsPerPlayer; ++m) {
+            if (!g.pawnInBase(p, m)) {
+                if (p == rootPlayer) ++myOut;
+                else ++oppOut;
+            }
+            best = std::min(best, pawnDistToGoal(goalDist(), g, p, m));
+        }
+        if (p == rootPlayer) {
+            myMin = best;
+        } else {
+            oppMin = std::min(oppMin, best);
+        }
     }
     if (myMin == kInf) myMin = 30;
     if (oppMin == kInf) oppMin = 30;
-    double v = (oppMin - myMin) / 10.0;
+    // Distance lead dominates; having more pawns on the track than the
+    // opponents is worth a little extra.
+    double v = (oppMin - myMin) / 10.0 + (myOut - oppOut) * 0.05;
     if (v > 1.0) v = 1.0;
     if (v < -1.0) v = -1.0;
     return v;
@@ -748,16 +764,18 @@ Point cheapBarricadePlacement(const Game& game) {
     int scored = 0;
     for (const Point& c : pt.rank) {
         if (game.barricadeAt(c) || game.pawnAt(c) != -1) continue;
-        if (++scored > 5) break;
+        if (++scored > 12) break;
 
         const int cg = distAt(dist, c);
         const int fwd = pt.fwd[indexOf(c)];
-        const int oppImpact = (fwd == 1) ? 40 : 2;
-        const int myImpact = (fwd == 1) ? 1000 : 2;
+        const int oppImpact = (fwd == 1) ? 60 : 3;
+        const int myImpact = (fwd == 1) ? 1000 : 3;
 
         int gain = 0;
         for (int i = 0; i < nOp; ++i) {
-            if (opDist[i] != kInf && cg < opDist[i]) gain += oppImpact;
+            if (opDist[i] != kInf && cg < opDist[i]) {
+                gain += oppImpact * (opDist[i] <= 8 ? 2 : 1);
+            }
         }
         int lose = 0;
         for (int om = 0; om < kPawnsPerPlayer; ++om) {
@@ -778,46 +796,71 @@ Point cheapBarricadePlacement(const Game& game) {
     return best;
 }
 
-Point naiveBarricadePlacement(const Game& game) {
+std::vector<Point> currentBarricades(const Game& game) {
     std::vector<Point> blocks;
     for (const Point& b : game.barricades()) {
         if (b.x >= 0) blocks.push_back(b);
     }
-    const auto baseDist = bfsFromGoal(blocks);
+    return blocks;
+}
 
+// Scores a candidate barricade placement: how much it slows down every
+// opponent pawn (weighted more when the pawn is close to the goal) minus how
+// much it slows our own pawns. `baseDist` is the goal BFS over the board with
+// the barricades currently on it.
+int scoreBarricade(const Game& game, const std::vector<int>& baseDist, Point c) {
+    std::vector<Point> blocked = currentBarricades(game);
+    blocked.push_back(c);
+    const auto bd = bfsFromGoal(blocked);
+
+    int gain = 0;
+    for (int op = 0; op < game.playerCount(); ++op) {
+        if (op == game.currentPlayer()) continue;
+        for (int om = 0; om < kPawnsPerPlayer; ++om) {
+            const int a = pawnDistToGoal(baseDist, game, op, om);
+            if (a == kInf) continue;
+            const int b = pawnDistToGoal(bd, game, op, om);
+            gain += (b == kInf) ? 60 : (b - a) * (a <= 8 ? 2 : 1);
+        }
+    }
+    int lose = 0;
+    for (int om = 0; om < kPawnsPerPlayer; ++om) {
+        const int a = pawnDistToGoal(baseDist, game, game.currentPlayer(), om);
+        if (a == kInf) continue;
+        const int b = pawnDistToGoal(bd, game, game.currentPlayer(), om);
+        lose += (b == kInf) ? 1000 : (b - a) * 2;
+    }
+    return gain - lose;
+}
+
+Point naiveBarricadePlacement(const Game& game) {
+    const auto baseDist = bfsFromGoal(currentBarricades(game));
     const auto cells = game.barricadePlacements();
     Point best{0, 0};
     int bestScore = -kInf;
     for (const Point& c : cells) {
-        std::vector<Point> blocked = blocks;
-        blocked.push_back(c);
-        const auto bd = bfsFromGoal(blocked);
-
-        int gain = 0;
-        for (int op = 0; op < game.playerCount(); ++op) {
-            if (op == game.currentPlayer()) continue;
-            for (int om = 0; om < kPawnsPerPlayer; ++om) {
-                const int a = pawnDistToGoal(baseDist, game, op, om);
-                const int b = pawnDistToGoal(bd, game, op, om);
-                if (a == kInf) continue;
-                gain += (b == kInf) ? 40 : (b - a);
-            }
-        }
-        int lose = 0;
-        for (int om = 0; om < kPawnsPerPlayer; ++om) {
-            const int a = pawnDistToGoal(baseDist, game, game.currentPlayer(), om);
-            const int b = pawnDistToGoal(bd, game, game.currentPlayer(), om);
-            if (a == kInf) continue;
-            lose += (b == kInf) ? 1000 : (b - a);
-        }
-
-        const int score = gain - lose;
-        if (score > bestScore || (score == bestScore && c.y < best.y)) {
-            bestScore = score;
+        const int s = scoreBarricade(game, baseDist, c);
+        if (s > bestScore || (s == bestScore && c.y < best.y)) {
+            bestScore = s;
             best = c;
         }
     }
     return best;
+}
+
+std::vector<BarricadeRecommendation> barricadeRecommendations(const Game& game, int topN) {
+    std::vector<BarricadeRecommendation> out;
+    const auto baseDist = bfsFromGoal(currentBarricades(game));
+    for (const Point& c : game.barricadePlacements()) {
+        out.push_back({c, static_cast<double>(scoreBarricade(game, baseDist, c))});
+    }
+    std::sort(out.begin(), out.end(),
+              [](const BarricadeRecommendation& a, const BarricadeRecommendation& b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.cell.y < b.cell.y;
+              });
+    if (static_cast<int>(out.size()) > topN) out.resize(static_cast<size_t>(topN));
+    return out;
 }
 
 }  // namespace barricade
