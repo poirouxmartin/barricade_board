@@ -53,18 +53,16 @@ void Game::reset() {
             pawns_[p][m] = {-1, -1};  // in base
         }
     }
+    for (int i = 0; i < barricade_grid_.size(); ++i) barricade_grid_[i] = 0;
     for (int y = 0; y < kRows; ++y) {
-        for (int x = 0; x < kCols; ++x) {
-            barricade_grid_[x][y] = 0;
-            pawn_grid_[x][y] = 255;
-        }
+        for (int x = 0; x < kCols; ++x) pawn_grid_[x][y] = 255;
     }
     int b = 0;
     for (int y = 0; y < 14; ++y) {
         for (int x = 0; x < kCols; ++x) {
             if (isInitialBarricadeCell(x, y)) {
                 barricades_[b++] = {x, y};
-                barricade_grid_[x][y] = 1;
+                setBarricade({x, y});
             }
         }
     }
@@ -81,8 +79,8 @@ void Game::nextTurn() {
 }
 
 bool Game::ownPawnAt(Point p, int player) const {
-    const uint8_t id = pawn_grid_[p.x][p.y];
-    return id != 255 && id / kPawnsPerPlayer == player;
+    const int id = pawnAt(p);
+    return id >= 0 && id / kPawnsPerPlayer == player;
 }
 
 // Depth-first walk collecting legal landing cells. Returns true when `out` is
@@ -112,7 +110,7 @@ bool Game::explore(Point cur, Point prev, int steps, Point* out, int& count, int
     for (int i = 0; i < n; ++i) {
         const Point np = cands[i];
         if (np == prev) continue;                                   // no double-back
-        if (steps > 1 && barricade_grid_[np.x][np.y]) continue;     // cannot pass over a barricade
+        if (steps > 1 && barricadeAt(np)) continue;                 // cannot pass over a barricade
         if (explore(np, cur, steps - 1, out, count, maxOut, player, seen)) return true;
     }
     return false;
@@ -160,7 +158,7 @@ bool Game::applyMove(int player, int pawn, Point dest) {
     if (over_ || player != current_) return false;
 
     const Point old = pawns_[player][pawn];
-    if (old.x >= 0) pawn_grid_[old.x][old.y] = 255;
+    if (old.x >= 0) setPawn(old, 31);
     for (int p = 0; p < player_count_; ++p) {
         if (p == player) continue;
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
@@ -172,13 +170,13 @@ bool Game::applyMove(int player, int pawn, Point dest) {
             pending_barricade_ = true;
             captured_barricade_ = i;
             barricades_[i] = {-1, -1};
-            barricade_grid_[dest.x][dest.y] = 0;
+            clearBarricade(dest);
             break;
         }
     }
 
     pawns_[player][pawn] = dest;
-    pawn_grid_[dest.x][dest.y] = static_cast<uint8_t>(player * kPawnsPerPlayer + pawn);
+    setPawn(dest, player * kPawnsPerPlayer + pawn);
     if (isGoalCell(dest.x, dest.y)) {
         over_ = true;
         winner_ = player;
@@ -206,7 +204,7 @@ bool Game::placeBarricade(Point dest) {
     const auto cells = barricadePlacements();
     if (std::find(cells.begin(), cells.end(), dest) == cells.end()) return false;
     barricades_[captured_barricade_] = dest;
-    barricade_grid_[dest.x][dest.y] = 1;
+    setBarricade(dest);
     pending_barricade_ = false;
     if (!over_) nextTurn();
     return true;
@@ -215,7 +213,7 @@ bool Game::placeBarricade(Point dest) {
 bool Game::placeBarricadeFast(Point dest) {
     if (!pending_barricade_) return false;
     barricades_[captured_barricade_] = dest;
-    barricade_grid_[dest.x][dest.y] = 1;
+    setBarricade(dest);
     pending_barricade_ = false;
     if (!over_) nextTurn();
     return true;
@@ -237,7 +235,22 @@ int Game::pawnAt(Point p) const {
 }
 
 bool Game::barricadeAt(Point p) const {
-    return barricade_grid_[p.x][p.y] != 0;
+    const int i = p.y * kCols + p.x;
+    return (barricade_grid_[i >> 6] >> (i & 63)) & 1ULL;
+}
+
+void Game::setPawn(Point p, int id) {
+    pawn_grid_[p.x][p.y] = static_cast<uint8_t>(id);
+}
+
+void Game::setBarricade(Point p) {
+    const int i = p.y * kCols + p.x;
+    barricade_grid_[i >> 6] |= 1ULL << (i & 63);
+}
+
+void Game::clearBarricade(Point p) {
+    const int i = p.y * kCols + p.x;
+    barricade_grid_[i >> 6] &= ~(1ULL << (i & 63));
 }
 
 }  // namespace barricade

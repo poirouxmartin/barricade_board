@@ -57,6 +57,9 @@ private:
                  int player, char* seen) const;
     bool ownPawnAt(Point p, int player) const;
     bool applyMove(int player, int pawn, Point dest);
+    void setPawn(Point p, int id);  // id player*5+pawn, or 255 = empty
+    void setBarricade(Point p);
+    void clearBarricade(Point p);
 
     int player_count_;
     int current_ = 0;
@@ -68,7 +71,10 @@ private:
 
     std::array<std::array<Point, kPawnsPerPlayer>, kMaxPlayers> pawns_;
     std::array<Point, kBarricadeCount> barricades_;
-    std::array<std::array<char, kRows>, kCols> barricade_grid_{};
+    // Bit-packed barricade grid (1-bit bitmap) to shrink Game for the MCTS
+    // tree; the pawn grid stays a direct byte array because 5-bit packing
+    // slowed the hot `pawnAt` path.
+    std::array<uint64_t, (kCols * kRows + 63) / 64> barricade_grid_{};
     std::array<std::array<uint8_t, kRows>, kCols> pawn_grid_{};  // player*5+pawn or 255
 };
 
