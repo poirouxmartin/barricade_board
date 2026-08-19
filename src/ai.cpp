@@ -878,4 +878,73 @@ std::vector<BarricadeRecommendation> barricadeRecommendations(const Game& game, 
     return out;
 }
 
+// Plays one full end-game from `g` (which must be mid-turn: either dice rolled
+// or a barricade pending) and returns the winner, or -1 if the turn cap was hit.
+static int simulateOneGame(const Game& g, std::mt19937& rng) {
+    Game sim = g;
+    for (int turns = 0; turns < 5000; ++turns) {
+        if (sim.isOver()) return sim.winner();
+        if (sim.pendingBarricade()) {
+            sim.placeBarricadeFast(cheapBarricadePlacement(sim));
+        } else if (sim.dice() == 0) {
+            sim.startTurn();
+        } else {
+            const AIMove mv = cheapMove(sim, sim.currentPlayer(), rng);
+            if (mv.pawn >= 0) {
+                sim.movePawnFast(sim.currentPlayer(), mv.pawn, mv.dest);
+            } else {
+                sim.nextTurn();  // no legal move: turn skipped
+            }
+        }
+    }
+    return -1;
+}
+
+std::vector<double> simulateWinChances(const Game& game, long long nGames, int nThreads) {
+    const int players = game.playerCount();
+    if (nGames <= 0) return std::vector<double>(players, 0.0);
+    std::atomic<bool> stop{false};
+    std::vector<std::atomic<long long>> wins(players);
+    std::atomic<long long> games{0};
+    simulateWinChancesAsync(game, nGames, &stop, &wins, &games, nThreads);
+    std::vector<double> out(players, 0.0);
+    long long total = 0;
+    for (int p = 0; p < players; ++p) total += wins[p].load();
+    if (total > 0) {
+        for (int p = 0; p < players; ++p) {
+            out[p] = static_cast<double>(wins[p].load()) / total;
+        }
+    }
+    return out;
+}
+
+void simulateWinChancesAsync(const Game& game, long long targetGames,
+                             std::atomic<bool>* stop,
+                             std::vector<std::atomic<long long>>* winsOut,
+                             std::atomic<long long>* gamesOut,
+                             int nThreads) {
+    const int players = game.playerCount();
+    if (nThreads < 1) nThreads = std::thread::hardware_concurrency();
+    if (nThreads < 1) nThreads = 1;
+    if (nThreads > 16) nThreads = 16;
+
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(nThreads));
+    for (int t = 0; t < nThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            std::mt19937 rng(std::random_device{}() ^
+                             (static_cast<unsigned>(t) * 2654435761u));
+            while (!stop->load(std::memory_order_relaxed)) {
+                if (gamesOut->load(std::memory_order_relaxed) >= targetGames) break;
+                const int w = simulateOneGame(game, rng);
+                if (w >= 0 && w < players) {
+                    winsOut->at(static_cast<size_t>(w)).fetch_add(1, std::memory_order_relaxed);
+                }
+                gamesOut->fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (std::thread& th : threads) th.join();
+}
+
 }  // namespace barricade

@@ -390,10 +390,10 @@ PanelLayout panelLayout() {
     L.adviseBtn = {kPanelX + kPanelPad, kStatusH + 50, kPanelW - 2 * kPanelPad, 34};
     const int y1 = kStatusH + 96;
     const int y2 = y1 + 124 + 10;
-    const int y3 = y2 + 146 + 10;
-    const int y4 = y3 + 166 + 10;
+    const int y3 = y2 + 148 + 10;
+    const int y4 = y3 + 170 + 10;
     const int adviceY = y4 + 64 + 10;
-    L.adviceBox = {kPanelX + kPanelPad, adviceY, kPanelW - 2 * kPanelPad, 134};
+    L.adviceBox = {kPanelX + kPanelPad, adviceY, kPanelW - 2 * kPanelPad, 132};
     L.adviceClose = {L.adviceBox.x + L.adviceBox.w - 26, L.adviceBox.y + 7, 20, 20};
     return L;
 }
@@ -439,11 +439,11 @@ int deepPct(const barricade::Game& game, const barricade::SearchInfo& info) {
 
 void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade::Game& game,
                const AdviceView& advice, const barricade::SearchInfo& info,
-               const std::string& lastAiText, bool humanTurn, bool match, int analysisMode) {
+               const std::string& lastAiText, bool humanTurn, bool match, int analysisMode,
+               long long simGames, const std::vector<double>& simShares) {
     const int cx = kPanelX + kPanelPad;
     const int cw = kPanelW - 2 * kPanelPad;
     const PanelLayout L = panelLayout();
-    const int cur = game.currentPlayer();
 
     // Panel title
     renderText(r, font, "Analyse IA", cx, kStatusH + 12, kTextColor);
@@ -485,37 +485,65 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         row("", "aucune recherche", kTextDim);
     }
 
-    // Evaluation de la course box (whole-army static estimate + board state)
-    const SDL_Rect b2{cx, b1.y + b1.h + 10, cw, 146};
-    drawBox(r, b2, "Evaluation de la course (heuristique)", font);
+    // Evaluation des gains box: static whole-army heuristic vs end-game simulation
+    const SDL_Rect b2{cx, b1.y + b1.h + 10, cw, 148};
+    drawBox(r, b2, "Evaluation des gains (statique vs simule)", font);
     const std::vector<double> chances = barricade::winChances(game);
     yy = b2.y + 26;
+    char buf[64];
     for (int p = 0; p < game.playerCount(); ++p) {
-        const int barX = b2.x + 84, barW = 150, barH = 14, barY = yy + 1;
+        const int statBarX = b2.x + 76, statBarW = 44;
+        const int simBarX = b2.x + 178, simBarW = 70;
+        const int yb = yy + 1, barH = 12;
+        renderText(r, small, kPlayerNames[p], b2.x + 8, yy, kPlayerColors[p]);
+        renderText(r, small, "stat", b2.x + 50, yy, kTextDim);
         setColor(r, {15, 12, 8, 255});
-        const SDL_Rect bg{barX, barY, barW, barH};
-        SDL_RenderFillRect(r, &bg);
-        const int fill = static_cast<int>(barW * chances[p]);
-        if (fill > 0) {
+        const SDL_Rect sbg{statBarX, yb, statBarW, barH};
+        SDL_RenderFillRect(r, &sbg);
+        const int sfill = static_cast<int>(statBarW * chances[p]);
+        if (sfill > 0) {
             setColor(r, kPlayerColors[p]);
-            const SDL_Rect fg{barX + 1, barY + 1, fill - 2, barH - 2};
-            SDL_RenderFillRect(r, &fg);
+            const SDL_Rect sfg{statBarX + 1, yb + 1, sfill - 2, barH - 2};
+            SDL_RenderFillRect(r, &sfg);
         }
         setColor(r, {255, 255, 255, 60});
-        SDL_RenderDrawRect(r, &bg);
-        char buf[24];
-        std::snprintf(buf, sizeof buf, "%s", kPlayerNames[p]);
-        renderText(r, small, buf, b2.x + 8, yy, kPlayerColors[p]);
+        SDL_RenderDrawRect(r, &sbg);
         std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(chances[p] * 100.0)));
-        renderText(r, small, buf, barX + barW + 8, yy, kTextColor);
-        yy += 20;
+        renderText(r, small, buf, statBarX + statBarW + 4, yy, kTextColor);
+        renderText(r, small, "sim", b2.x + 152, yy, kTextDim);
+        const double sim = simShares.empty() ? 0.0 : simShares[p];
+        setColor(r, {15, 12, 8, 255});
+        const SDL_Rect ibg{simBarX, yb, simBarW, barH};
+        SDL_RenderFillRect(r, &ibg);
+        const int ifill = static_cast<int>(simBarW * sim);
+        if (ifill > 0) {
+            setColor(r, kPlayerColors[p]);
+            const SDL_Rect ifg{simBarX + 1, yb + 1, ifill - 2, barH - 2};
+            SDL_RenderFillRect(r, &ifg);
+        }
+        setColor(r, {255, 255, 255, 60});
+        SDL_RenderDrawRect(r, &ibg);
+        std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)));
+        renderText(r, small, buf, simBarX + simBarW + 4, yy, kTextColor);
+        yy += 26;
     }
+    if (simGames > 0) {
+        std::snprintf(buf, sizeof buf, "Simulation : %s parties (fin de partie)",
+                      groupThousands(simGames).c_str());
+    } else {
+        std::snprintf(buf, sizeof buf, "Simulation : en cours...");
+    }
+    renderText(r, small, buf, b2.x + 10, b2.y + 128, kGold);
+
+    // Heuristiques (parametres) box: live inputs + scoring constants
     const std::vector<std::vector<int>> army = [&]() {
         std::vector<std::vector<int>> v(game.playerCount());
         for (int p = 0; p < game.playerCount(); ++p) v[p] = barricade::playerArmyDistances(game, p);
         return v;
     }();
-    char buf[128];
+    const SDL_Rect b3{cx, b2.y + b2.h + 10, cw, 170};
+    drawBox(r, b3, "Heuristiques (parametres)", font);
+    yy = b3.y + 26;
     std::snprintf(buf, sizeof buf, "Dist. but (moy.) :");
     for (int p = 0; p < game.playerCount(); ++p) {
         int sum = 0, cnt = 0;
@@ -531,24 +559,11 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
                           kPlayerNames[p], (sum + cnt / 2) / cnt);
         }
     }
-    renderText(r, small, buf, b2.x + 10, b2.y + 108, kTextColor);
-    std::snprintf(buf, sizeof buf, "Pions en piste :");
-    for (int p = 0; p < game.playerCount(); ++p) {
-        int out = 0;
-        for (int m = 0; m < barricade::kPawnsPerPlayer; ++m) {
-            if (!game.pawnInBase(p, m)) ++out;
-        }
-        std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " %s:%d", kPlayerNames[p], out);
-    }
-    renderText(r, small, buf, b2.x + 10, b2.y + 126, kTextColor);
-
-    // Heuristiques (parametres) box
-    const SDL_Rect b3{cx, b2.y + b2.h + 10, cw, 166};
-    drawBox(r, b3, "Heuristiques (parametres)", font);
-    yy = b3.y + 26;
+    renderText(r, small, buf, b3.x + 10, yy, kTextColor);
+    yy += 16;
     const auto param = [&](const std::string& text) {
         renderText(r, small, text, b3.x + 10, yy, kTextDim);
-        yy += 17;
+        yy += 16;
     };
     param("Eval = (dist. adv - dist. moi)/10 + 0,05/pion");
     param("Bloc adv. bloque : +60 (leader x2 si dist<=8)");
@@ -1025,6 +1040,37 @@ int main(int argc, char* argv[]) {
         }
     };
 
+    // End-game simulation running in the background for the current position:
+    // plays whole games with the fast greedy policies and counts real winners,
+    // which gives a finer win estimate than the static race heuristic.
+    struct SimRun {
+        std::atomic<bool> stop{true};
+        std::atomic<long long> games{0};
+        std::vector<std::atomic<long long>> wins;
+        std::thread th;
+        uint64_t sig = 0;
+    };
+    SimRun simRun;
+
+    const auto startSim = [&](uint64_t sig) {
+        simRun.stop.store(true);
+        if (simRun.th.joinable()) simRun.th.join();
+        simRun.sig = sig;
+        simRun.games.store(0);
+        simRun.wins.clear();
+        for (int p = 0; p < game.playerCount(); ++p) simRun.wins.emplace_back(0);
+        const barricade::Game snapshot = game;
+        simRun.stop.store(false);
+        simRun.th = std::thread([snapshot, &simRun] {
+            barricade::simulateWinChancesAsync(snapshot, 1000000000LL, &simRun.stop, &simRun.wins,
+                                               &simRun.games, 0);
+        });
+    };
+    const auto stopSim = [&] {
+        simRun.stop.store(true);
+        if (simRun.th.joinable()) simRun.th.join();
+    };
+
     bool running = true;
     while (running) {
         int mouseX = 0, mouseY = 0;
@@ -1267,6 +1313,13 @@ int main(int argc, char* argv[]) {
             const uint64_t sig = posSig(game);
             const int wantMode = game.pendingBarricade() ? 2 : 1;
 
+            // keep the end-game simulation fresh for the current position
+            if (game.isOver()) {
+                stopSim();
+            } else if (sig != simRun.sig) {
+                startSim(sig);
+            }
+
             // auto-analyse the current position on a human turn
             const bool humanPhase =
                 !game.isOver() && !isAi(game.currentPlayer()) && game.dice() > 0;
@@ -1294,10 +1347,21 @@ int main(int argc, char* argv[]) {
             const bool showHints =
                 !game.isOver() && !game.pendingBarricade() && !isAi(game.currentPlayer());
             const bool humanTurn = !isAi(game.currentPlayer());
+            long long simGames = simRun.games.load(std::memory_order_relaxed);
+            std::vector<double> simShares(game.playerCount(), 0.0);
+            if (!simRun.wins.empty()) {
+                long long sum = 0;
+                for (const auto& w : simRun.wins) sum += w.load(std::memory_order_relaxed);
+                if (sum > 0) {
+                    for (int p = 0; p < game.playerCount(); ++p) {
+                        simShares[p] = static_cast<double>(simRun.wins[p].load(std::memory_order_relaxed)) / sum;
+                    }
+                }
+            }
             drawBoard(renderer, font, wood, game, selectedPawn, hoverPawn, showHints, msg, anim,
                       lastMove, lastMoveAt, advice, adviceMatch);
             drawPanel(renderer, font, small, game, advice, barricade::mctsInfo(), lastAiText,
-                      humanTurn, adviceMatch, adviceMode);
+                      humanTurn, adviceMatch, adviceMode, simGames, simShares);
         } else {
             drawMenu(renderer, titleFont, font, wood, mouseX, mouseY, menuPlayers, menuHumans);
         }
@@ -1307,6 +1371,7 @@ int main(int argc, char* argv[]) {
 
     if (aiBusy) aiThread.join();
     if (adviceBusy) adviceThread.join();
+    stopSim();
 
     if (wood) SDL_DestroyTexture(wood);
     if (titleFont && titleFont != font) TTF_CloseFont(titleFont);

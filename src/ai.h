@@ -3,6 +3,9 @@
 #include "board.h"
 #include "game.h"
 
+#include <atomic>
+#include <vector>
+
 namespace barricade {
 
 struct AIMove {
@@ -76,5 +79,21 @@ struct BarricadeRecommendation {
     double score = 0.0;
 };
 std::vector<BarricadeRecommendation> barricadeRecommendations(const Game& game, int topN);
+
+// Plays `nGames` full end-games from the current position with the fast greedy
+// policies (cheapMove + cheapBarricadePlacement) and returns each player's
+// fraction of wins among the resolved games (so the shares sum to 1; games
+// that never end because the track is deadlocked are excluded).
+std::vector<double> simulateWinChances(const Game& game, long long nGames, int nThreads = 0);
+
+// Background variant: keeps playing end-games on `nThreads` workers until
+// `*stop` is set or `targetGames` have been played, adding each finished game
+// to `gamesOut` and its winner to `winsOut` (both sized playerCount(), atomics).
+// Returns when the workers have finished; call it from a background thread.
+void simulateWinChancesAsync(const Game& game, long long targetGames,
+                             std::atomic<bool>* stop,
+                             std::vector<std::atomic<long long>>* winsOut,
+                             std::atomic<long long>* gamesOut,
+                             int nThreads = 0);
 
 }  // namespace barricade

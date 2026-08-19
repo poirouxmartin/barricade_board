@@ -1,7 +1,10 @@
 #include "ai.h"
 #include "game.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <thread>
 
 using namespace barricade;
 
@@ -235,6 +238,42 @@ check(g.placeBarricade(cells[0]), "barricade placed");
             check(has(g.legalDestinations(g.currentPlayer(), mv.pawn), mv.dest), "mcts dest is legal");
             check(g.movePawn(g.currentPlayer(), mv.pawn, mv.dest), "mcts move applies");
         }
+    }
+
+    // End-game simulation always produces a full probability distribution.
+    {
+        Game g(4);
+        g.forceDice(3);
+        const auto p = simulateWinChances(g, 4000);
+        check(p.size() == 4, "simulation covers all 4 players");
+        double sum = 0.0;
+        for (double v : p) sum += v;
+        check(sum > 0.99 && sum < 1.01, "simulation shares sum to 1");
+    }
+
+    // Simulation from a fresh 2-player game runs to completion (no stall).
+    {
+        Game g(2);
+        g.forceDice(3);
+        const auto p = simulateWinChances(g, 2000);
+        double sum = 0.0;
+        for (double v : p) sum += v;
+        check(sum > 0.99 && sum < 1.01, "2-player simulation shares sum to 1");
+    }
+
+    // Simulation restarts on demand: the async worker counts games.
+    {
+        Game g(4);
+        g.forceDice(3);
+        std::atomic<bool> stop{false};
+        std::vector<std::atomic<long long>> wins(4);
+        std::atomic<long long> games{0};
+        std::thread th([&] { simulateWinChancesAsync(g, 20000, &stop, &wins, &games, 2); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        stop.store(true);
+        th.join();
+        check(games.load() > 0, "async simulation ran games");
+        check(games.load() <= 20000, "async simulation stops at target");
     }
 
     if (failures == 0) {
