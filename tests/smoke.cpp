@@ -188,6 +188,42 @@ check(g.placeBarricade(cells[0]), "barricade placed");
         check(recs.size() <= 6, "recommendations capped at topN");
     }
 
+    // A "clean block" regression guard: red leads via the LEFT border, blue
+    // via the RIGHT, red holds a barricade. The placement must slow blue's
+    // pawn down while leaving red's own route untouched (the exact BFS scorer
+    // keeps the goal-adjacent barricade (8,1) out of its blocked set, which is
+    // what makes the distances finite in the first place).
+    {
+        Game g(2);
+        g.movePawnFast(0, 0, {1, 3});
+        g.movePawnFast(1, 0, {15, 3});
+        g.movePawnFast(0, 0, {0, 3});
+        g.movePawnFast(0, 0, {0, 2});
+        g.movePawnFast(0, 0, {0, 1});
+        g.movePawnFast(0, 0, {1, 1});  // red leader on the left corridor
+        g.movePawnFast(1, 0, {16, 3});
+        g.movePawnFast(1, 0, {16, 2});
+        g.movePawnFast(1, 0, {16, 1});
+        g.movePawnFast(1, 0, {15, 1});  // blue leader on the right corridor
+        g.movePawnFast(0, 1, {4, 11});  // capture barricade -> pending
+        check(g.pendingBarricade(), "clean block setup: barricade pending");
+        check(has(g.barricadePlacements(), cheapBarricadePlacement(g, dynamicGoalDist(g))),
+              "cheap placement is a legal cell");
+        const auto recs = barricadeRecommendations(g, 6);
+        check(!recs.empty() && recs[0].cell.x >= 9, "exact scorer prefers the opponent's side");
+        const auto before = dynamicGoalDist(g);
+        Game placed = g;
+        const Point c = cheapBarricadePlacement(g, before);
+        check(placed.placeBarricadeFast(c), "cheap placement applies");
+        const auto redBefore = playerArmyDistances(g, 0)[0];
+        const auto redAfter = playerArmyDistances(placed, 0)[0];
+        const auto blueBefore = playerArmyDistances(g, 1)[0];
+        const auto blueAfter = playerArmyDistances(placed, 1)[0];
+        constexpr int kInf = 1000000;
+        check(redBefore < kInf && redBefore == redAfter, "clean block does not slow our own leader");
+        check(blueBefore < kInf && blueAfter > blueBefore, "clean block slows the opponent leader");
+    }
+
     // Naive AI returns a legal move for the current player.
     {
         Game g(2);

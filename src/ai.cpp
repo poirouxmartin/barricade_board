@@ -17,17 +17,29 @@ namespace {
 
 constexpr int kInf = 1000000;
 constexpr double kUctC = 1.414;
-constexpr int kRolloutSteps = 10;
+// Rollouts run to the end of the game (like the win-chance simulation), so the
+// MCTS value is the actual end-game win rate, not the short-horizon heuristic:
+// a move that lowers the simulated win chances is then rarely picked.
+constexpr int kRolloutSteps = 5000;
 constexpr int kMaxIterations = 2000000;
-// How many candidate cells a placement node branches over, and how many free
-// cells of the static ranking it scans to build that shortlist.
-constexpr int kBarricadeBranch = 6;
-constexpr int kPlacementScan = 24;
+// How many candidate cells a placement node branches over. The cheap scorer
+// scans every free track cell, so a good mid-board block of an opponent is
+// never missed (the old 24-cell prefix of the ranking only saw cells near the
+// goal, which made every bot dump its barricade at the top and block itself).
+constexpr int kBarricadeBranch = 8;
 }  // namespace
 
 // Defined below (with the placement scoring); the search and the win-chance
 // estimates call it so they see the barricades currently on the board.
 std::vector<Point> currentBarricades(const Game& game);
+
+// Exact BFS-based placement score (defined below with the placement helpers);
+// the cheap candidate scorer uses it to refine its shortlist.
+int scoreBarricade(const Game& game, const std::vector<int>& baseDist, Point c);
+
+// Goal BFS base distances for the placement scores (defined below): current
+// barricades except the goal-adjacent (8,1), which would make them all kInf.
+const std::vector<int> baseGoalDist(const Game& game);
 
 namespace {
 
@@ -957,10 +969,6 @@ std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
                                             const std::vector<int>& dist) {
     const PlacementTables& pt = placementTables();
 
-    int myDist[kPawnsPerPlayer];
-    for (int om = 0; om < kPawnsPerPlayer; ++om) {
-        myDist[om] = pawnDistToGoal(dist, game, game.currentPlayer(), om);
-    }
     int opDist[kMaxPlayers * kPawnsPerPlayer];
     int nOp = 0;
     for (int op = 0; op < game.playerCount(); ++op) {
@@ -975,15 +983,19 @@ std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
         int score;
     };
     std::vector<Cand> cands;
-    int considered = 0;
+    cands.reserve(160);
     for (const Point& c : pt.rank) {
         if (game.barricadeAt(c) || game.pawnAt(c) != -1) continue;
-        if (++considered > kPlacementScan) break;
-
         const int cg = distAt(dist, c);
+        if (cg == kInf) continue;
+
         const int fwd = pt.fwd[indexOf(c)];
-        const int oppImpact = (fwd == 1) ? 60 : 3;
-        const int myImpact = (fwd == 1) ? 1000 : 3;
+        // The cheap prefilter ranks cells by how many opponents they slow down
+        // (weighted more near the goal). It deliberately ignores our own pawns:
+        // the distance model cannot tell a block on the opponent's side from a
+        // block on our side, so penalizing our own pawns here could drop the
+        // clean block out of the shortlist before the exact scorer sees it.
+        const int oppImpact = (fwd == 1) ? 50 : 4;
 
         int gain = 0;
         for (int i = 0; i < nOp; ++i) {
@@ -991,12 +1003,16 @@ std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
                 gain += oppImpact * (opDist[i] <= 8 ? 2 : 1);
             }
         }
-        int lose = 0;
-        for (int om = 0; om < kPawnsPerPlayer; ++om) {
-            if (myDist[om] != kInf && cg < myDist[om]) lose += myImpact;
-        }
-        cands.push_back({c, gain - lose});
+        cands.push_back({c, gain});
     }
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.score > b.score; });
+    if (cands.size() > 16) cands.resize(16);
+    // Refine the shortlist with the exact BFS scorer: it measures the real
+    // detour (or trap) for every pawn, so a clean block of the opponents wins
+    // without penalizing our own route.
+    const auto baseDist = baseGoalDist(game);
+    for (Cand& cd : cands) cd.score = scoreBarricade(game, baseDist, cd.c);
     std::sort(cands.begin(), cands.end(),
               [](const Cand& a, const Cand& b) { return a.score > b.score; });
     std::vector<Point> out;
@@ -1031,12 +1047,35 @@ std::vector<Point> currentBarricades(const Game& game) {
     return blocks;
 }
 
+// Goal BFS distances with the current barricades, except the goal-adjacent
+// one (8,1): it sits on the only path to the goal, so as a wall it would make
+// every distance kInf (see scoreBarricade). Used as the base for placement
+// scoring.
+const std::vector<int> baseGoalDist(const Game& game) {
+    std::vector<Point> blocked;
+    for (const Point& b : currentBarricades(game)) {
+        if (b.x == 8 && b.y == 1) continue;
+        blocked.push_back(b);
+    }
+    return bfsFromGoal(blocked);
+}
+
 // Scores a candidate barricade placement: how much it slows down every
 // opponent pawn (weighted more when the pawn is close to the goal) minus how
 // much it slows our own pawns. `baseDist` is the goal BFS over the board with
-// the barricades currently on it.
+// the barricades currently on it (see baseGoalDist). The goal-adjacent
+// barricade (8,1) sits on the only approach to the goal: treating it as an
+// impassable wall would make every distance kInf and every score 0, so it is
+// kept out of the blocked set (as if already captured, which is what must
+// happen before anyone can win).
 int scoreBarricade(const Game& game, const std::vector<int>& baseDist, Point c) {
-    std::vector<Point> blocked = currentBarricades(game);
+    const std::vector<Point>& cur = currentBarricades(game);
+    std::vector<Point> blocked;
+    blocked.reserve(cur.size() + 1);
+    for (const Point& b : cur) {
+        if (b.x == 8 && b.y == 1) continue;
+        blocked.push_back(b);
+    }
     blocked.push_back(c);
     const auto bd = bfsFromGoal(blocked);
 
@@ -1061,7 +1100,7 @@ int scoreBarricade(const Game& game, const std::vector<int>& baseDist, Point c) 
 }
 
 Point naiveBarricadePlacement(const Game& game) {
-    const auto baseDist = bfsFromGoal(currentBarricades(game));
+    const auto baseDist = baseGoalDist(game);
     const auto cells = game.barricadePlacements();
     Point best{0, 0};
     int bestScore = -kInf;
@@ -1077,7 +1116,7 @@ Point naiveBarricadePlacement(const Game& game) {
 
 std::vector<BarricadeRecommendation> barricadeRecommendations(const Game& game, int topN) {
     std::vector<BarricadeRecommendation> out;
-    const auto baseDist = bfsFromGoal(currentBarricades(game));
+    const auto baseDist = baseGoalDist(game);
     for (const Point& c : game.barricadePlacements()) {
         out.push_back({c, static_cast<double>(scoreBarricade(game, baseDist, c))});
     }
