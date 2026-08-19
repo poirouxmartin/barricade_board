@@ -25,6 +25,10 @@ constexpr int kBarricadeBranch = 6;
 constexpr int kPlacementScan = 24;
 }  // namespace
 
+// Defined below (with the placement scoring); the search and the win-chance
+// estimates call it so they see the barricades currently on the board.
+std::vector<Point> currentBarricades(const Game& game);
+
 namespace {
 
 int indexOf(Point p) {
@@ -137,6 +141,48 @@ const std::vector<int>& goalDist() {
     return d;
 }
 
+// Same weighted goal distance but accounting for the barricades currently on
+// the board: a barricade cell costs kBarricadePenalty extra (it must be
+// captured to pass), so the bots stop routing through freshly placed walls.
+// The static `goalDist()` above only penalizes the fixed initial barricades,
+// which is why pawns used to walk straight into the walls the players build.
+std::vector<int> buildGoalDistDynamic(const std::vector<Point>& blocked) {
+    std::vector<char> isBlocked(kCols * kRows, 0);
+    for (const Point& b : blocked) isBlocked[indexOf(b)] = 1;
+
+    std::vector<int> dist(kCols * kRows, kInf);
+    std::vector<char> done(kCols * kRows, 0);
+    const Point goal{8, 0};
+    dist[indexOf(goal)] = 0;
+
+    const int dx[4] = {1, -1, 0, 0};
+    const int dy[4] = {0, 0, 1, -1};
+    for (;;) {
+        int best = -1;
+        int bestDist = kInf;
+        for (int i = 0; i < kCols * kRows; ++i) {
+            if (!done[i] && dist[i] < bestDist) {
+                bestDist = dist[i];
+                best = i;
+            }
+        }
+        if (best < 0) break;
+        done[best] = 1;
+        const Point cur{best % kCols, best / kCols};
+        for (int k = 0; k < 4; ++k) {
+            const Point np{cur.x + dx[k], cur.y + dy[k]};
+            if (!isTrackCell(np.x, np.y)) continue;
+            const int ni = indexOf(np);
+            const int cost = 1 + ((isInitialBarricadeCell(np.x, np.y) || isBlocked[ni])
+                                      ? kBarricadePenalty
+                                      : 0);
+            const int nd = bestDist + cost;
+            if (nd < dist[ni]) dist[ni] = nd;
+        }
+    }
+    return dist;
+}
+
 // Unweighted BFS distance to the goal (no barricade penalty): the exact number
 // of steps needed to reach the goal, used to detect a pawn that can win this
 // turn.
@@ -153,19 +199,18 @@ int pawnDistToGoal(const std::vector<int>& dist, const Game& g, int player, int 
     return distAt(dist, g.pawnPos(player, pawn));
 }
 
-int progress(const Game& g, int player) {
+int progress(const Game& g, int player, const std::vector<int>& dist) {
     int best = kInf;
     for (int m = 0; m < kPawnsPerPlayer; ++m) {
-        best = std::min(best, pawnDistToGoal(goalDist(), g, player, m));
+        best = std::min(best, pawnDistToGoal(dist, g, player, m));
     }
     return best;
 }
 
-double heuristicEval(const Game& g, int rootPlayer) {
+double heuristicEval(const Game& g, int rootPlayer, const std::vector<int>& dist) {
     if (g.isOver()) return g.winner() == rootPlayer ? 1.0 : -1.0;
 
     const auto& raw = rawGoalDist();
-    const auto& dist = goalDist();
     int myD[kPawnsPerPlayer];
     int oppD[kMaxPlayers * kPawnsPerPlayer];
     int nOpp = 0;
@@ -204,11 +249,17 @@ double heuristicEval(const Game& g, int rootPlayer) {
     if (myMin == kInf) myMin = 30;
     if (oppMin == kInf) oppMin = 30;
 
-    // A pawn one exact step from the goal wins on the player's next turn (the
-    // goal cannot be barricaded), so it reads as a terminal position. The
-    // linear distance term would only score it as a small lead (1 vs 3 -> 20%).
-    if (myOne == 1 && oppOne > 1) return 1.0;
-    if (oppOne == 1 && myOne > 1) return -1.0;
+    // A pawn within a single die roll of the goal (raw distance: the goal can
+    // never be barricaded) is a near-win; the linear terms alone would only
+    // score it as a small lead. Give it a large bonus that grows as it gets
+    // closer. Only an actual win (isOver above) is worth exactly 100%.
+    const int kWinRange = 6;
+    if (myOne <= kWinRange && myOne < oppOne) {
+        return 0.98 - 0.04 * myOne;  // 1 step -> 0.94, 6 steps -> 0.74
+    }
+    if (oppOne <= kWinRange && oppOne < myOne) {
+        return -(0.98 - 0.04 * oppOne);
+    }
 
     // Capture adjacency: pawns racing within ~1 step of goal-distance of each
     // other can eat one another (all move towards the same goal). Weighing it
@@ -242,12 +293,12 @@ double heuristicEval(const Game& g, int rootPlayer) {
 // steps greedily. Equal scores are broken randomly so the rollout does not
 // systematically favor one side of the board (the static neighbor table is
 // ordered right-first, which would bias a fixed tie-break).
-Point greedyWalkDest(const Game& g, int player, int pawn, std::mt19937& rng) {
+Point greedyWalkDest(const Game& g, int player, int pawn, std::mt19937& rng,
+                     const std::vector<int>& dist) {
     const int dice = g.dice();
     Point cur = g.pawnPos(player, pawn);
     Point prev = cur;
     bool inBase = g.pawnInBase(player, pawn);
-    const auto& dist = goalDist();
     const auto& nb = neighbors();
     for (int step = 0; step < dice; ++step) {
         const bool last = step == dice - 1;
@@ -324,7 +375,8 @@ AIMove cheapMoveFallback(const Game& g, int player, std::mt19937& rng) {
 
 // Cheap rollout move: picks a random pawn and walks it greedily to the goal.
 // Falls back to an exact search when the walk finds no move for any pawn.
-AIMove cheapMove(const Game& g, int player, std::mt19937& rng) {
+AIMove cheapMove(const Game& g, int player, std::mt19937& rng,
+                 const std::vector<int>& dist) {
     if (g.dice() <= 0) return {};
     // A pawn that can land exactly on the goal this turn must always take the
     // win; otherwise the random pawn order would waste the turn on another pawn
@@ -356,22 +408,23 @@ AIMove cheapMove(const Game& g, int player, std::mt19937& rng) {
         std::swap(order[i], order[rng() % (i + 1)]);
     }
     for (int k = 0; k < kPawnsPerPlayer; ++k) {
-        const Point d = greedyWalkDest(g, player, order[k], rng);
+        const Point d = greedyWalkDest(g, player, order[k], rng, dist);
         if (d.x >= 0) return {order[k], d};
     }
     return cheapMoveFallback(g, player, rng);
 }
 
 // Simulates a game from `g0` to the end (or horizon) using the heuristic.
-double rollout(const Game& g0, int rootPlayer, std::mt19937& rng) {
+double rollout(const Game& g0, int rootPlayer, std::mt19937& rng,
+               const std::vector<int>& dist) {
     Game g = g0;
     for (int step = 0; step < kRolloutSteps && !g.isOver(); ++step) {
         if (g.pendingBarricade()) {
-            g.placeBarricadeFast(cheapBarricadePlacement(g));
+            g.placeBarricadeFast(cheapBarricadePlacement(g, dist));
         } else if (g.dice() == 0) {
             g.startTurn();
         } else {
-            const AIMove mv = cheapMove(g, g.currentPlayer(), rng);
+            const AIMove mv = cheapMove(g, g.currentPlayer(), rng, dist);
             if (mv.pawn >= 0) {
                 g.movePawnFast(g.currentPlayer(), mv.pawn, mv.dest);
             } else {
@@ -380,7 +433,7 @@ double rollout(const Game& g0, int rootPlayer, std::mt19937& rng) {
         }
     }
     if (g.isOver()) return g.winner() == rootPlayer ? 1.0 : -1.0;
-    return heuristicEval(g, rootPlayer);
+    return heuristicEval(g, rootPlayer, dist);
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +446,8 @@ struct TreeNode;
 struct TreeLink;
 
 // Defined below with the placement scoring; used by the tree descent.
-std::vector<Point> cheapBarricadeCandidates(const Game& game, int K);
+std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
+                                            const std::vector<int>& dist);
 
 struct TreeNode {
     explicit TreeNode(Game&& g) : game(std::move(g)) {}
@@ -489,9 +543,9 @@ std::atomic<double> g_winProb{0.0};
 // A node with a pending barricade is a placement node: its actions are the
 // best candidate cells for the captured barricade (pawn == -1 marks a
 // placement). Otherwise the actions are the pawn moves.
-void expandNode(TreeNode* n) {
+void expandNode(TreeNode* n, const std::vector<int>& dist) {
     if (n->game.pendingBarricade()) {
-        for (const Point& c : cheapBarricadeCandidates(n->game, kBarricadeBranch)) {
+        for (const Point& c : cheapBarricadeCandidates(n->game, kBarricadeBranch, dist)) {
             n->actions.push_back({-1, c});
         }
     } else {
@@ -552,7 +606,8 @@ TreeNode* uctSelect(TreeNode* n) {
 
 // One worker's search on its private tree, until the shared deadline.
 void treeSearch(TreeNode* root, int player,
-                std::chrono::steady_clock::time_point start, int budgetMs, Worker& w) {
+                std::chrono::steady_clock::time_point start, int budgetMs, Worker& w,
+                const std::vector<int>& dist) {
     std::mt19937 rng(std::random_device{}());
     const auto deadline = start + std::chrono::milliseconds(budgetMs);
     std::vector<TreeNode*> path;
@@ -568,7 +623,7 @@ void treeSearch(TreeNode* root, int player,
             n = c;
             path.push_back(n);
         }
-        if (!n->expanded) expandNode(n);
+        if (!n->expanded) expandNode(n, dist);
 
         double v;
         if (n->nextAction < n->actions.size()) {
@@ -579,7 +634,7 @@ void treeSearch(TreeNode* root, int player,
                 continue;
             }
             publish(n, child, n->actions[idx], w);
-            v = rollout(child->game, player, rng);
+            v = rollout(child->game, player, rng, dist);
             child->visits = 1;
             child->score = v;
             for (TreeNode* p : path) {
@@ -588,7 +643,7 @@ void treeSearch(TreeNode* root, int player,
             }
             w.depthSum += path.size() + 1;  // depth of the new leaf
         } else {
-            v = heuristicEval(n->game, player);
+            v = heuristicEval(n->game, player, dist);
             for (TreeNode* p : path) {
                 p->visits++;
                 p->score += v;
@@ -669,6 +724,10 @@ std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budge
                                          int nThreads) {
     if (game.dice() <= 0 || game.isOver()) return {};
 
+    // Goal distances that penalize the barricades currently on the board, so
+    // the rollouts stop routing pawns through the walls the players build.
+    const auto dist = buildGoalDistDynamic(currentBarricades(game));
+
     if (nThreads < 1) nThreads = std::thread::hardware_concurrency();
     if (nThreads < 1) nThreads = 1;
     if (nThreads > 16) nThreads = 16;
@@ -685,13 +744,13 @@ std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budge
     }
 
     if (nThreads == 1) {
-        treeSearch(roots[0], player, start, budgetMs, *workers[0]);
+        treeSearch(roots[0], player, start, budgetMs, *workers[0], dist);
     } else {
         std::vector<std::thread> threads;
         threads.reserve(nThreads);
         for (int t = 0; t < nThreads; ++t) {
             threads.emplace_back(
-                [&, t] { treeSearch(roots[t], player, start, budgetMs, *workers[t]); });
+                [&, t] { treeSearch(roots[t], player, start, budgetMs, *workers[t], dist); });
         }
         for (std::thread& th : threads) th.join();
     }
@@ -772,16 +831,18 @@ SearchInfo mctsInfo() {
 // Each player's minimum distance to the goal; pawns with no reachable path
 // report kInf.
 std::vector<int> playerProgress(const Game& game) {
+    const auto dist = buildGoalDistDynamic(currentBarricades(game));
     std::vector<int> out(game.playerCount());
-    for (int p = 0; p < game.playerCount(); ++p) out[p] = progress(game, p);
+    for (int p = 0; p < game.playerCount(); ++p) out[p] = progress(game, p, dist);
     return out;
 }
 
 // Per-pawn weighted distance to the goal for `player`.
 std::vector<int> playerArmyDistances(const Game& game, int player) {
+    const auto dist = buildGoalDistDynamic(currentBarricades(game));
     std::vector<int> out(kPawnsPerPlayer);
     for (int m = 0; m < kPawnsPerPlayer; ++m) {
-        out[m] = pawnDistToGoal(goalDist(), game, player, m);
+        out[m] = pawnDistToGoal(dist, game, player, m);
     }
     return out;
 }
@@ -807,12 +868,16 @@ std::vector<double> winChances(const Game& game) {
     }
     if (leader >= 0) {
         std::vector<double> out(game.playerCount(), 0.0);
-        out[leader] = 1.0;
+        out[leader] = 0.95;  // big bonus for the near-win, not a sure 100%
+        const double rest = 0.05 / (game.playerCount() - 1);
+        for (int p = 0; p < game.playerCount(); ++p) {
+            if (p != leader) out[p] = rest;
+        }
         return out;
     }
 
     std::vector<double> out(game.playerCount());
-    const auto& dist = goalDist();
+    const auto dist = buildGoalDistDynamic(currentBarricades(game));
     for (int p = 0; p < game.playerCount(); ++p) {
         double s = 0.0;
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
@@ -831,7 +896,9 @@ std::vector<double> winChances(const Game& game) {
 std::vector<MctsRecommendation> mctsRecommendations(const Game& game, int player, int budgetMs) {
     std::vector<MctsRecommendation> out;
     for (const ActionStats& s : mctsActionStats(game, player, budgetMs)) {
-        if (s.move.pawn < 0 || s.visits == 0) continue;
+        // Drop only the skip pseudo-action; a placement action (pawn == -1 with
+        // a real cell) is a legitimate recommendation.
+        if ((s.move.pawn < 0 && s.move.dest.x < 0) || s.visits == 0) continue;
         out.push_back({s.move, s.visits, s.score / s.visits});
     }
     std::sort(out.begin(), out.end(),
@@ -886,9 +953,9 @@ const PlacementTables& placementTables() {
 // tree descent can call it through the forward declaration above.
 namespace {
 
-std::vector<Point> cheapBarricadeCandidates(const Game& game, int K) {
+std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
+                                            const std::vector<int>& dist) {
     const PlacementTables& pt = placementTables();
-    const auto& dist = goalDist();
 
     int myDist[kPawnsPerPlayer];
     for (int om = 0; om < kPawnsPerPlayer; ++om) {
@@ -941,8 +1008,8 @@ std::vector<Point> cheapBarricadeCandidates(const Game& game, int K) {
 
 }  // namespace
 
-Point cheapBarricadePlacement(const Game& game) {
-    const std::vector<Point> cands = cheapBarricadeCandidates(game, 1);
+Point cheapBarricadePlacement(const Game& game, const std::vector<int>& dist) {
+    const std::vector<Point> cands = cheapBarricadeCandidates(game, 1, dist);
     if (!cands.empty()) return cands[0];
     // Very crowded board: nothing scored, return the first legal cell.
     const PlacementTables& pt = placementTables();
@@ -950,6 +1017,10 @@ Point cheapBarricadePlacement(const Game& game) {
         if (!game.barricadeAt(c) && game.pawnAt(c) == -1) return c;
     }
     return {0, 0};
+}
+
+std::vector<int> dynamicGoalDist(const Game& game) {
+    return buildGoalDistDynamic(currentBarricades(game));
 }
 
 std::vector<Point> currentBarricades(const Game& game) {
@@ -1023,14 +1094,15 @@ std::vector<BarricadeRecommendation> barricadeRecommendations(const Game& game, 
 // or a barricade pending) and returns the winner, or -1 if the turn cap was hit.
 static int simulateOneGame(const Game& g, std::mt19937& rng) {
     Game sim = g;
+    const auto dist = buildGoalDistDynamic(currentBarricades(g));
     for (int turns = 0; turns < 5000; ++turns) {
         if (sim.isOver()) return sim.winner();
         if (sim.pendingBarricade()) {
-            sim.placeBarricadeFast(cheapBarricadePlacement(sim));
+            sim.placeBarricadeFast(cheapBarricadePlacement(sim, dist));
         } else if (sim.dice() == 0) {
             sim.startTurn();
         } else {
-            const AIMove mv = cheapMove(sim, sim.currentPlayer(), rng);
+            const AIMove mv = cheapMove(sim, sim.currentPlayer(), rng, dist);
             if (mv.pawn >= 0) {
                 sim.movePawnFast(sim.currentPlayer(), mv.pawn, mv.dest);
             } else {

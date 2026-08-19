@@ -61,7 +61,10 @@ std::vector<int> playerProgress(const Game& game);
 std::vector<int> playerArmyDistances(const Game& game, int player);
 
 // Estimated win probabilities per player (normalized so they sum to 1),
-// based on the whole army: the sum of per-pawn weights 1/(dist+3).
+// based on the whole army: the sum of per-pawn weights 1/(dist+2). A player
+// one exact step from the goal (unique leader) gets a large 0.95 share; only
+// an actual win is exactly 1.0. Uses goal distances that account for the
+// barricades currently on the board.
 std::vector<double> winChances(const Game& game);
 
 // Greedy heuristic: picks a barricade placement that slows opponents
@@ -70,7 +73,13 @@ Point naiveBarricadePlacement(const Game& game);
 
 // Fast variant of `naiveBarricadePlacement` for the MCTS search (rollouts and
 // tree descent): no BFS, uses a static cell ranking instead.
-Point cheapBarricadePlacement(const Game& game);
+Point cheapBarricadePlacement(const Game& game, const std::vector<int>& dist);
+
+// Weighted goal-distance map that penalizes the barricades currently on the
+// board (each costs kBarricadePenalty extra, as it must be captured to pass).
+// The static `goalDist` used by `naiveMove` ignores the current barricades,
+// which made pawns walk into freshly placed walls.
+std::vector<int> dynamicGoalDist(const Game& game);
 
 // Ranked barricade placements (best first) for the advice UI. `score` is the
 // raw gain-lose value; the caller normalizes it to a percentage.

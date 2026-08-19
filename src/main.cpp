@@ -425,6 +425,7 @@ void engineLoop(AnalysisEngine& E) {
             // pending) returns the best placements. Each is then scored by a
             // 2000-game position simulation.
             std::vector<ScenarioView> sc;
+            const auto dist = barricade::dynamicGoalDist(snapshot);
             const auto recs = barricade::mctsRecommendations(
                 snapshot, snapshot.currentPlayer(), static_cast<int>(budget));
             for (const auto& rec : recs) {
@@ -446,8 +447,11 @@ void engineLoop(AnalysisEngine& E) {
                                         rec.move.dest)) {
                         continue;
                     }
+                    // A move that captured a barricade brings a placement with
+                    // it; estimate its value with the same dynamic distances
+                    // the search uses.
                     if (child.pendingBarricade()) {
-                        child.placeBarricadeFast(barricade::cheapBarricadePlacement(child));
+                        child.placeBarricadeFast(barricade::cheapBarricadePlacement(child, dist));
                     }
                     ScenarioView sv;
                     sv.move = rec.move;
@@ -711,9 +715,9 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         }
         setColor(r, {255, 255, 255, 60});
         SDL_RenderDrawRect(r, &ibg);
-        std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)));
+std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)));
         renderText(r, small, buf, simBarX + simBarW + 4, yy, kTextColor);
-        yy += 26;
+        yy += 24;
     }
     // simulation counter + pause/resume toggle
     if (simPaused) {
@@ -723,13 +727,11 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
     } else {
         std::snprintf(buf, sizeof buf, "Simulation : en cours...");
     }
-    renderText(r, small, buf, b2.x + 10, b2.y + 128, kGold);
-    drawSmallButton(r, small, b2.x + cw - 66, b2.y + 124, 58, 20,
-                    simPaused ? "Lancer" : "Pause", false);
+    renderText(r, small, buf, b2.x + 10, b2.y + 116, kGold);
 
     // Evolution of the static win chances over the game (one point per move)
-    renderText(r, small, "Evolution des chances", b2.x + 10, b2.y + 142, kTextDim);
-    const SDL_Rect plot{b2.x + 10, b2.y + 156, cw - 20, 40};
+    renderText(r, small, "Evolution des chances", b2.x + 10, b2.y + 128, kTextDim);
+    const SDL_Rect plot{b2.x + 10, b2.y + 140, cw - 20, 56};
     setColor(r, {15, 12, 8, 255});
     SDL_RenderFillRect(r, &plot);
     setColor(r, {255, 255, 255, 60});
@@ -1251,7 +1253,7 @@ int main(int argc, char* argv[]) {
 
     // Static win-chance history for the evolution graph (one point per move).
     std::vector<std::vector<double>> winHist;
-    winHist.reserve(100);
+    winHist.reserve(512);
 
     // Asynchronous AI: the search runs in a background thread so the UI keeps
     // animating; the result is applied on the main thread.
@@ -1743,7 +1745,7 @@ int main(int argc, char* argv[]) {
             // position, so a change means a move was made)
             const std::vector<double> chancesNow = barricade::winChances(game);
             if (winHist.empty() || winHist.back() != chancesNow) {
-                if (winHist.size() >= 90) winHist.erase(winHist.begin());
+                if (winHist.size() >= 500) winHist.erase(winHist.begin());
                 winHist.push_back(chancesNow);
             }
             drawBoard(renderer, font, small, wood, game, selectedPawn, hoverPawn, showHints, msg, anim,

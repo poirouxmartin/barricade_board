@@ -259,6 +259,26 @@ check(g.placeBarricade(cells[0]), "barricade placed");
         }
     }
 
+    // Advice on a placement root must return placement recommendations: the
+    // freeze bug filtered every placement out of mctsRecommendations because
+    // placement actions carry pawn == -1 (regression guard for the advice UI).
+    {
+        Game g(2);
+        g.movePawnFast(0, 0, {4, 12});
+        g.movePawnFast(1, 0, {6, 13});
+        g.movePawnFast(0, 0, {4, 11});  // capture barricade -> pending
+        check(g.pendingBarricade(), "placement advice setup: barricade pending");
+        const auto recs = mctsRecommendations(g, g.currentPlayer(), 300);
+        bool anyPlacement = false;
+        for (const auto& r : recs) {
+            if (r.move.pawn < 0 && r.move.dest.x >= 0) {
+                check(has(g.barricadePlacements(), r.move.dest), "placement advice cell is legal");
+                anyPlacement = true;
+            }
+        }
+        check(anyPlacement, "advice returns at least one placement recommendation");
+    }
+
     // End-game simulation always produces a full probability distribution.
     {
         Game g(4);
