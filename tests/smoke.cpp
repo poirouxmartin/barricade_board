@@ -243,6 +243,22 @@ check(g.placeBarricade(cells[0]), "barricade placed");
         }
     }
 
+    // With a barricade pending, the MCTS branches on placements: it must
+    // return a barricade cell (pawn == -1) that is a legal placement.
+    {
+        Game g(2);
+        g.movePawnFast(0, 0, {4, 12});  // red on track
+        g.movePawnFast(1, 0, {6, 13});  // blue out
+        g.movePawnFast(0, 0, {4, 11});  // capture barricade (4,11) -> pending
+        check(g.pendingBarricade(), "placement node setup: barricade pending");
+        const auto mv = mctsMove(g, g.currentPlayer(), 400);
+        check(mv.pawn < 0 && mv.dest.x >= 0, "mcts returns a placement with a pending barricade");
+        if (mv.pawn < 0 && mv.dest.x >= 0) {
+            check(has(g.barricadePlacements(), mv.dest), "mcts placement cell is legal");
+            check(g.placeBarricade(mv.dest), "mcts placement applies");
+        }
+    }
+
     // End-game simulation always produces a full probability distribution.
     {
         Game g(4);

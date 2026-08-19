@@ -420,28 +420,30 @@ void engineLoop(AnalysisEngine& E) {
         double budget = E.baseMs.load();
         E.step.store(0);
         while (!E.exit.load() && !E.requestStop.load() && !E.want.load()) {
+            // Both modes search with the MCTS: a move node (mode 1) returns the
+            // best pawn moves, a placement node (mode 2, a captured barricade
+            // pending) returns the best placements. Each is then scored by a
+            // 2000-game position simulation.
             std::vector<ScenarioView> sc;
-            if (mode == 2) {
-                const auto recs = barricade::barricadeRecommendations(snapshot, 4);
-                for (const auto& rec : recs) {
-                    barricade::Game child = snapshot;
-                    if (!child.placeBarricadeFast(rec.cell)) continue;
+            const auto recs = barricade::mctsRecommendations(
+                snapshot, snapshot.currentPlayer(), static_cast<int>(budget));
+            for (const auto& rec : recs) {
+                barricade::Game child = snapshot;
+                if (mode == 2) {
+                    if (rec.move.pawn >= 0 || rec.move.dest.x < 0) continue;
+                    if (!child.placeBarricadeFast(rec.move.dest)) continue;
                     ScenarioView sv;
-                    sv.cell = rec.cell;
+                    sv.cell = rec.move.dest;
                     sv.isPlacement = true;
-                    sv.value = rec.score;
+                    sv.value = rec.value;
+                    sv.visits = rec.visits;
                     sv.shares = barricade::simulateWinChances(child, 2000);
                     sv.sims = 2000;
                     sc.push_back(std::move(sv));
-                }
-            } else {
-                const auto recs =
-                    barricade::mctsRecommendations(snapshot, snapshot.currentPlayer(),
-                                                   static_cast<int>(budget));
-                for (const auto& rec : recs) {
+                } else {
                     if (rec.move.pawn < 0) continue;
-                    barricade::Game child = snapshot;
-                    if (!child.movePawn(snapshot.currentPlayer(), rec.move.pawn, rec.move.dest)) {
+                    if (!child.movePawn(snapshot.currentPlayer(), rec.move.pawn,
+                                        rec.move.dest)) {
                         continue;
                     }
                     if (child.pendingBarricade()) {
@@ -550,15 +552,16 @@ PanelLayout panelLayout(bool expandedOverlay) {
     PanelLayout L;
     L.adviseBtn = {kPanelX + kPanelPad, kStatusH + 50, kPanelW - 2 * kPanelPad, 34};
     const int y1 = kStatusH + 96;
-    const int y2 = y1 + 124 + 10;
-    const int y3 = y2 + 148 + 10;
-    const int y4 = y3 + 170 + 10;
+    const int y2 = y1 + 124 + 10;   // MCTS box
+    const int y3 = y2 + 200 + 10;   // gains box (bars + evolution graph)
+    const int y4 = y3 + 112 + 10;   // heuristics box
     if (expandedOverlay) {
         // the conseils box grows over the params/strategy boxes (the gains box
         // with its pause button stays visible)
         L.adviceBox = {kPanelX + kPanelPad, y3, kPanelW - 2 * kPanelPad, kWinH - 30 - y3};
     } else {
-        L.adviceBox = {kPanelX + kPanelPad, y4 + 64 + 10, kPanelW - 2 * kPanelPad, 132};
+        // anchored to the bottom so it never collides with the strategy box
+        L.adviceBox = {kPanelX + kPanelPad, kWinH - 30 - 132, kPanelW - 2 * kPanelPad, 132};
     }
     L.adviceClose = {L.adviceBox.x + L.adviceBox.w - 26, L.adviceBox.y + 7, 20, 20};
     return L;
@@ -617,7 +620,8 @@ int deepPct(const barricade::Game& game, const barricade::SearchInfo& info) {
 void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade::Game& game,
                const AdviceView& advice, const barricade::SearchInfo& info,
                const std::string& lastAiText, bool humanTurn, bool match, int analysisMode,
-               long long simGames, const std::vector<double>& simShares, bool simPaused) {
+               long long simGames, const std::vector<double>& simShares, bool simPaused,
+               const std::vector<std::vector<double>>& winHist) {
     const int cx = kPanelX + kPanelPad;
     const int cw = kPanelW - 2 * kPanelPad;
     const PanelLayout L = panelLayout(advice.show);
@@ -670,7 +674,7 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
     }
 
     // Evaluation des gains box: static whole-army heuristic vs end-game simulation
-    const SDL_Rect b2{cx, b1.y + b1.h + 10, cw, 148};
+    const SDL_Rect b2{cx, b1.y + b1.h + 10, cw, 200};
     drawBox(r, b2, "Gains : statique vs simule", font);
     const std::vector<double> chances = barricade::winChances(game);
     yy = b2.y + 26;
@@ -723,13 +727,36 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
     drawSmallButton(r, small, b2.x + cw - 66, b2.y + 124, 58, 20,
                     simPaused ? "Lancer" : "Pause", false);
 
+    // Evolution of the static win chances over the game (one point per move)
+    renderText(r, small, "Evolution des chances", b2.x + 10, b2.y + 142, kTextDim);
+    const SDL_Rect plot{b2.x + 10, b2.y + 156, cw - 20, 40};
+    setColor(r, {15, 12, 8, 255});
+    SDL_RenderFillRect(r, &plot);
+    setColor(r, {255, 255, 255, 60});
+    SDL_RenderDrawRect(r, &plot);
+    const int histN = static_cast<int>(winHist.size());
+    if (histN >= 2) {
+        for (int p = 0; p < game.playerCount(); ++p) {
+            setColor(r, kPlayerColors[p]);
+            int px = -1, py = -1;
+            for (int i = 0; i < histN; ++i) {
+                const int x = plot.x + (i * (plot.w - 1)) / std::max(histN - 1, 1);
+                const double v = (i < static_cast<int>(winHist[i].size())) ? winHist[i][p] : 0.0;
+                const int y = plot.y + plot.h - 1 - static_cast<int>(v * (plot.h - 2));
+                if (px >= 0) drawLine(r, px, py, x, y);
+                px = x;
+                py = y;
+            }
+        }
+    }
+
     // Heuristiques (parametres) box: live inputs + scoring constants
     const std::vector<std::vector<int>> army = [&]() {
         std::vector<std::vector<int>> v(game.playerCount());
         for (int p = 0; p < game.playerCount(); ++p) v[p] = barricade::playerArmyDistances(game, p);
         return v;
     }();
-    const SDL_Rect b3{cx, b2.y + b2.h + 10, cw, 170};
+    const SDL_Rect b3{cx, b2.y + b2.h + 10, cw, 112};
     drawBox(r, b3, "Heuristiques (parametres)", font);
     yy = b3.y + 26;
     std::snprintf(buf, sizeof buf, "Dist. but :");
@@ -754,14 +781,10 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         renderText(r, small, text, b3.x + 10, yy, kTextDim);
         yy += 16;
     };
-    param("Eval = (dist. adv - dist. moi)/10 + 0,05/pion");
-    param("Bloc adv. bloque : +60 (leader x2 si dist<=8)");
-    param("Bloc adv. detour : +1/case");
-    param("Bloc bloque ma piste : -1000 | detour : -2/case");
-    param("Penalite case bloc fixe (BFS) : +8");
-    param("Rollout : 10 pas | UCT C : 1,41");
-    param("Capture pion : +1500 | bloc : +200 | risque : -250");
-    param("Greedy rollout : cap -10000, bloc -5000");
+    param("Eval = min/10 + armee x1,2 + sortis + capture");
+    param("Bloc : adv +60 x2 | moi -1000 | detour");
+    param("Capture +1500 | bloc +200 | risque -250");
+    param("Rollout 10 | UCT 1,41 | BFS bloc +8 | cap/bloc");
 
     // Strategie box
     const SDL_Rect b4{cx, b3.y + b3.h + 10, cw, 64};
@@ -875,7 +898,9 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
             setColor(r, kAdvicePalette[i % 8]);
             fillCircle(r, box.x + 18, yy + 8, 6);
             renderText(r, small, line, box.x + 30, yy, kTextColor);
-            const long long sims = sv.isPlacement ? sv.sims : sv.visits;
+            // Coherent with the shares shown below: both come from the 2000-game
+            // position simulation (the MCTS visits are a different estimator).
+            const long long sims = sv.sims;
             std::snprintf(line, sizeof line, "%s sims", groupThousands(sims).c_str());
             renderText(r, small, line, box.x + box.w - 118, yy, kTextDim);
             // per-player simulated win shares for this move
@@ -1224,6 +1249,10 @@ int main(int argc, char* argv[]) {
     barricade::Point lastMove{-1, -1};
     Uint32 lastMoveAt = 0;
 
+    // Static win-chance history for the evolution graph (one point per move).
+    std::vector<std::vector<double>> winHist;
+    winHist.reserve(100);
+
     // Asynchronous AI: the search runs in a background thread so the UI keeps
     // animating; the result is applied on the main thread.
     bool aiBusy = false;
@@ -1231,7 +1260,6 @@ int main(int argc, char* argv[]) {
     std::thread aiThread;
     barricade::AIMove aiMove;
     bool aiIsPlacement = false;
-    barricade::Point aiPlace{0, 0};
     Uint32 aiNextAt = 0;
 
     // Computer analysis for a human turn. A background search runs
@@ -1392,6 +1420,7 @@ int main(int argc, char* argv[]) {
                         skipPending = false;
                         anim = Anim{};
                         lastMove = {-1, -1};
+                        winHist.clear();
                         state = AppState::Playing;
                     }
                 } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
@@ -1425,6 +1454,7 @@ int main(int argc, char* argv[]) {
                         skipPending = false;
                         anim = Anim{};
                         lastMove = {-1, -1};
+                        winHist.clear();
                         state = AppState::Playing;
                     }
                 }
@@ -1442,6 +1472,7 @@ int main(int argc, char* argv[]) {
                     skipPending = false;
                     anim = Anim{};
                     lastMove = {-1, -1};
+                    winHist.clear();
                     closeAdvice();
                 } else if (e.key.keysym.sym == SDLK_c) {
                     toggleAdvice();
@@ -1565,13 +1596,12 @@ int main(int argc, char* argv[]) {
                     const barricade::Game snapshot = game;
                     aiBusy = true;
                     aiHaveResult = false;
-                    aiThread = std::thread([snapshot, &aiMove, &aiPlace, &aiIsPlacement, &aiHaveResult] {
-                        if (snapshot.pendingBarricade()) {
-                            aiIsPlacement = true;
-                            aiPlace = barricade::naiveBarricadePlacement(snapshot);
-                        } else {
-                            aiIsPlacement = false;
-                            aiMove = barricade::mctsMove(snapshot, snapshot.currentPlayer(), kAiBudget);
+                    aiThread = std::thread([snapshot, &aiMove, &aiIsPlacement, &aiHaveResult] {
+                        aiIsPlacement = snapshot.pendingBarricade();
+                        aiMove = barricade::mctsMove(snapshot, snapshot.currentPlayer(), kAiBudget);
+                        if (aiIsPlacement && aiMove.dest.x < 0) {
+                            // Fallback if the search found nothing (rare).
+                            aiMove.dest = barricade::naiveBarricadePlacement(snapshot);
                         }
                         aiHaveResult = true;
                     });
@@ -1581,8 +1611,8 @@ int main(int argc, char* argv[]) {
                 aiBusy = false;
                 const int cur = game.currentPlayer();
                 if (aiIsPlacement) {
-                    game.placeBarricade(aiPlace);
-                    lastMove = aiPlace;
+                    game.placeBarricade(aiMove.dest);
+                    lastMove = aiMove.dest;
                     lastMoveAt = SDL_GetTicks();
                     msg.clear();
                 } else if (aiMove.pawn >= 0) {
@@ -1709,11 +1739,18 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
+            // win-chance history for the evolution graph (deterministic per
+            // position, so a change means a move was made)
+            const std::vector<double> chancesNow = barricade::winChances(game);
+            if (winHist.empty() || winHist.back() != chancesNow) {
+                if (winHist.size() >= 90) winHist.erase(winHist.begin());
+                winHist.push_back(chancesNow);
+            }
             drawBoard(renderer, font, small, wood, game, selectedPawn, hoverPawn, showHints, msg, anim,
                       lastMove, lastMoveAt, advice, adviceMatch);
             drawPanel(renderer, font, small, game, advice, barricade::mctsInfo(), lastAiText,
                       humanTurn, adviceMatch, adviceMode, simGames, simShares,
-                      simRun.paused.load());
+                      simRun.paused.load(), winHist);
         } else {
             drawMenu(renderer, titleFont, font, wood, mouseX, mouseY, menuPlayers, menuHumans);
         }

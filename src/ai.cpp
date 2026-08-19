@@ -19,6 +19,10 @@ constexpr int kInf = 1000000;
 constexpr double kUctC = 1.414;
 constexpr int kRolloutSteps = 10;
 constexpr int kMaxIterations = 2000000;
+// How many candidate cells a placement node branches over, and how many free
+// cells of the static ranking it scans to build that shortlist.
+constexpr int kBarricadeBranch = 6;
+constexpr int kPlacementScan = 24;
 }  // namespace
 
 namespace {
@@ -161,29 +165,40 @@ double heuristicEval(const Game& g, int rootPlayer) {
     if (g.isOver()) return g.winner() == rootPlayer ? 1.0 : -1.0;
 
     const auto& raw = rawGoalDist();
+    const auto& dist = goalDist();
+    int myD[kPawnsPerPlayer];
+    int oppD[kMaxPlayers * kPawnsPerPlayer];
+    int nOpp = 0;
     int myMin = kInf;
     int oppMin = kInf;
     int myOne = kInf;  // exact number of steps to the goal (unweighted BFS)
     int oppOne = kInf;
+    double mySum = 0.0;
+    double oppSum = 0.0;
     int myOut = 0;
     int oppOut = 0;
-    for (int p = 0; p < g.playerCount(); ++p) {
-        int best = kInf;
-        int bestRaw = kInf;
-        for (int m = 0; m < kPawnsPerPlayer; ++m) {
-            if (!g.pawnInBase(p, m)) {
-                if (p == rootPlayer) ++myOut;
-                else ++oppOut;
-            }
-            best = std::min(best, pawnDistToGoal(goalDist(), g, p, m));
-            bestRaw = std::min(bestRaw, pawnDistToGoal(raw, g, p, m));
+    for (int m = 0; m < kPawnsPerPlayer; ++m) {
+        const int d = pawnDistToGoal(dist, g, rootPlayer, m);
+        myD[m] = d;
+        if (d != kInf) {
+            mySum += 1.0 / (d + 1.0);
+            myMin = std::min(myMin, d);
         }
-        if (p == rootPlayer) {
-            myMin = best;
-            myOne = bestRaw;
-        } else {
-            oppMin = std::min(oppMin, best);
-            oppOne = std::min(oppOne, bestRaw);
+        myOne = std::min(myOne, pawnDistToGoal(raw, g, rootPlayer, m));
+        if (!g.pawnInBase(rootPlayer, m)) ++myOut;
+    }
+    for (int p = 0; p < g.playerCount(); ++p) {
+        if (p == rootPlayer) continue;
+        for (int m = 0; m < kPawnsPerPlayer; ++m) {
+            const int d = pawnDistToGoal(dist, g, p, m);
+            oppD[nOpp] = d;
+            ++nOpp;
+            if (d != kInf) {
+                oppSum += 1.0 / (d + 1.0);
+                oppMin = std::min(oppMin, d);
+            }
+            oppOne = std::min(oppOne, pawnDistToGoal(raw, g, p, m));
+            if (!g.pawnInBase(p, m)) ++oppOut;
         }
     }
     if (myMin == kInf) myMin = 30;
@@ -195,9 +210,27 @@ double heuristicEval(const Game& g, int rootPlayer) {
     if (myOne == 1 && oppOne > 1) return 1.0;
     if (oppOne == 1 && myOne > 1) return -1.0;
 
-    // Distance lead dominates; having more pawns on the track than the
-    // opponents is worth a little extra.
-    double v = (oppMin - myMin) / 10.0 + (myOut - oppOut) * 0.05;
+    // Capture adjacency: pawns racing within ~1 step of goal-distance of each
+    // other can eat one another (all move towards the same goal). Weighing it
+    // slightly rewards threatening the opponent and penalizes being exposed.
+    int myThreat = 0;
+    int myRisk = 0;
+    for (int m = 0; m < kPawnsPerPlayer; ++m) {
+        if (myD[m] == kInf) continue;
+        for (int i = 0; i < nOpp; ++i) {
+            if (oppD[i] == kInf) continue;
+            if (std::abs(myD[m] - oppD[i]) <= 1) {
+                ++myThreat;
+                ++myRisk;
+            }
+        }
+    }
+
+    // Closest-pawn race dominates; the whole army (sum of 1/(dist+1)) and the
+    // pawns out of base add refinement, and capture adjacency a small nudge.
+    const double oppAvg = (g.playerCount() > 1) ? oppSum / (g.playerCount() - 1) : 0.0;
+    double v = (oppMin - myMin) / 10.0 + (mySum - oppAvg) * 1.2 +
+               (myOut - oppOut) * 0.02 + (myThreat - myRisk) * 0.01;
     if (v > 1.0) v = 1.0;
     if (v < -1.0) v = -1.0;
     return v;
@@ -359,6 +392,9 @@ double rollout(const Game& g0, int rootPlayer, std::mt19937& rng) {
 struct TreeNode;
 struct TreeLink;
 
+// Defined below with the placement scoring; used by the tree descent.
+std::vector<Point> cheapBarricadeCandidates(const Game& game, int K);
+
 struct TreeNode {
     explicit TreeNode(Game&& g) : game(std::move(g)) {}
     Game game;
@@ -450,13 +486,22 @@ std::atomic<double> g_avgDepth{0.0};
 std::atomic<double> g_winProb{0.0};
 
 // Builds the node's action list exactly once (the tree is private, no lock).
+// A node with a pending barricade is a placement node: its actions are the
+// best candidate cells for the captured barricade (pawn == -1 marks a
+// placement). Otherwise the actions are the pawn moves.
 void expandNode(TreeNode* n) {
-    Point dests[512];
-    char seen[kCols * kRows];
-    for (int m = 0; m < kPawnsPerPlayer; ++m) {
-        std::memset(seen, 0, sizeof seen);
-        const int cnt = n->game.legalDestinationsTo(n->player, m, dests, 512, seen);
-        for (int i = 0; i < cnt; ++i) n->actions.push_back({m, dests[i]});
+    if (n->game.pendingBarricade()) {
+        for (const Point& c : cheapBarricadeCandidates(n->game, kBarricadeBranch)) {
+            n->actions.push_back({-1, c});
+        }
+    } else {
+        Point dests[512];
+        char seen[kCols * kRows];
+        for (int m = 0; m < kPawnsPerPlayer; ++m) {
+            std::memset(seen, 0, sizeof seen);
+            const int cnt = n->game.legalDestinationsTo(n->player, m, dests, 512, seen);
+            for (int i = 0; i < cnt; ++i) n->actions.push_back({m, dests[i]});
+        }
     }
     if (n->actions.empty()) n->actions.push_back(AIMove{});  // skip pseudo-action
     n->expanded = true;
@@ -465,14 +510,16 @@ void expandNode(TreeNode* n) {
 TreeNode* createChild(TreeNode* n, const AIMove& mv, std::mt19937& rng, Worker& w) {
     Game g = n->game;
     if (mv.pawn >= 0) {
+        // Pawn move. A captured barricade is left pending on purpose: the child
+        // becomes a placement node so the search chooses where to put it.
         if (!g.movePawn(n->player, mv.pawn, mv.dest)) return nullptr;
-        if (g.pendingBarricade()) {
-            g.placeBarricadeFast(cheapBarricadePlacement(g));
-        }
+    } else if (mv.dest.x >= 0) {
+        // Placement action (pawn == -1, a real cell): put the barricade down.
+        if (!g.placeBarricadeFast(mv.dest)) return nullptr;
     } else {
-        g.nextTurn();
+        g.nextTurn();  // skip pseudo-action: no legal move
     }
-    g.forceDice(1 + rng() % 6);
+    if (!g.pendingBarricade()) g.forceDice(1 + rng() % 6);
 
     TreeNode* child = w.allocNode(std::move(g));
     child->player = child->game.currentPlayer();
@@ -740,10 +787,11 @@ std::vector<int> playerArmyDistances(const Game& game, int player) {
 }
 
 // Estimated win probabilities per player from the whole army: each pawn on
-// the track contributes 1/(dist+3), so advancing and having more pawns out of
-// the base improves the estimate. Normalized so the shares sum to 1. A player
-// one exact step from the goal (and nobody else that close) is resolved as a
-// sure win, since 1/(dist+3) would only read ~40% for it.
+// the track contributes 1/(dist+2), so advancing and having more pawns out of
+// the base improves the estimate (the curve is slightly sharper than the old
+// 1/(dist+3) to reward end-game proximity). Normalized so the shares sum to 1.
+// A player one exact step from the goal (and nobody else that close) is
+// resolved as a sure win, since the curve alone would only read ~40% for it.
 std::vector<double> winChances(const Game& game) {
     const auto& raw = rawGoalDist();
     int leader = -1;
@@ -770,7 +818,7 @@ std::vector<double> winChances(const Game& game) {
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
             int d = pawnDistToGoal(dist, game, p, m);
             if (d > 24) d = 24;
-            s += 1.0 / (d + 3.0);
+            s += 1.0 / (d + 2.0);
         }
         out[p] = s;
     }
@@ -834,8 +882,11 @@ const PlacementTables& placementTables() {
 // Uses the static ranking and static goal distances, so it never runs a BFS.
 // The score mirrors `naiveBarricadePlacement`: a choke point (`fwd == 1`)
 // traps every pawn behind it (gain 40 / loss 1000), anything else just makes
-// pawns detour (gain/loss 2).
-Point cheapBarricadePlacement(const Game& game) {
+// pawns detour (gain/loss 2). Internal helper (anonymous namespace) so the
+// tree descent can call it through the forward declaration above.
+namespace {
+
+std::vector<Point> cheapBarricadeCandidates(const Game& game, int K) {
     const PlacementTables& pt = placementTables();
     const auto& dist = goalDist();
 
@@ -852,12 +903,15 @@ Point cheapBarricadePlacement(const Game& game) {
         }
     }
 
-    Point best{0, 0};
-    int bestScore = -kInf;
-    int scored = 0;
+    struct Cand {
+        Point c;
+        int score;
+    };
+    std::vector<Cand> cands;
+    int considered = 0;
     for (const Point& c : pt.rank) {
         if (game.barricadeAt(c) || game.pawnAt(c) != -1) continue;
-        if (++scored > 12) break;
+        if (++considered > kPlacementScan) break;
 
         const int cg = distAt(dist, c);
         const int fwd = pt.fwd[indexOf(c)];
@@ -874,19 +928,28 @@ Point cheapBarricadePlacement(const Game& game) {
         for (int om = 0; om < kPawnsPerPlayer; ++om) {
             if (myDist[om] != kInf && cg < myDist[om]) lose += myImpact;
         }
-        const int score = gain - lose;
-        if (score > bestScore) {
-            bestScore = score;
-            best = c;
-        }
+        cands.push_back({c, gain - lose});
     }
-    if (bestScore == -kInf) {
-        // Very crowded board: nothing scored, return the first legal cell.
-        for (const Point& c : pt.rank) {
-            if (!game.barricadeAt(c) && game.pawnAt(c) == -1) return c;
-        }
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.score > b.score; });
+    std::vector<Point> out;
+    for (size_t i = 0; i < cands.size() && out.size() < static_cast<size_t>(K); ++i) {
+        out.push_back(cands[i].c);
     }
-    return best;
+    return out;
+}
+
+}  // namespace
+
+Point cheapBarricadePlacement(const Game& game) {
+    const std::vector<Point> cands = cheapBarricadeCandidates(game, 1);
+    if (!cands.empty()) return cands[0];
+    // Very crowded board: nothing scored, return the first legal cell.
+    const PlacementTables& pt = placementTables();
+    for (const Point& c : pt.rank) {
+        if (!game.barricadeAt(c) && game.pawnAt(c) == -1) return c;
+    }
+    return {0, 0};
 }
 
 std::vector<Point> currentBarricades(const Game& game) {
