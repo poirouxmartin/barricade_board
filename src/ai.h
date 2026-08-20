@@ -61,10 +61,11 @@ std::vector<int> playerProgress(const Game& game);
 std::vector<int> playerArmyDistances(const Game& game, int player);
 
 // Estimated win probabilities per player (normalized so they sum to 1),
-// based on the whole army: the sum of per-pawn weights 1/(dist+2). A player
-// one exact step from the goal (unique leader) gets a large 0.95 share; only
-// an actual win is exactly 1.0. Uses goal distances that account for the
-// barricades currently on the board.
+// based on the whole army: the sum of per-pawn weights 1/(turns+2), where
+// `turns` is the expected number of turns left (exact-dice). A player whose
+// closest pawn is within ~3 turns while everyone else is 8+ turns behind gets
+// a large 0.95 share; only an actual win is exactly 1.0. Uses goal distances
+// that account for the barricades currently on the board.
 std::vector<double> winChances(const Game& game);
 
 // Greedy heuristic: picks a barricade placement that slows opponents

@@ -214,12 +214,113 @@ const std::vector<int>& rawGoalDist() {
     return d;
 }
 
+// Expected number of turns (exact-dice) for a lone pawn to win from each track
+// cell of the static board, computed by value iteration. The exact-dice rule
+// makes the approach to the goal non-linear: from a cell adjacent to the gate
+// a pawn only gets through on odd rolls (it spends even rolls bouncing against
+// the gate), so a pawn one or two cells from the goal can be several turns
+// away while its raw step count reads almost there. Static heuristics that
+// score raw or weighted steps (winChances, heuristicEval) overstate such
+// positions; this map is the effective distance they should use.
+const std::vector<double>& expectedTurns() {
+    static const std::vector<double> e = [] {
+        const int N = kCols * kRows;
+        std::vector<char> isBar(N, 0);
+        for (int y = 0; y < 14; ++y) {
+            for (int x = 0; x < kCols; ++x) {
+                if (isInitialBarricadeCell(x, y)) isBar[y * kCols + x] = 1;
+            }
+        }
+
+        // reach[c*7+d] = cells reachable from c in exactly d steps: barricades
+        // block intermediate steps but may be entered (captured) as the final
+        // step; the start cell is always open under the pawn. The board is
+        // static, so the sets are computed once and reused by every iteration.
+        std::vector<std::vector<int>> reach(static_cast<size_t>(N) * 7);
+        for (int ci = 0; ci < N; ++ci) {
+            const Point c{ci % kCols, ci / kCols};
+            if (!isTrackCell(c.x, c.y)) continue;
+            for (int die = 1; die <= 6; ++die) {
+                std::vector<int> cur{ci};
+                for (int step = 1; step <= die; ++step) {
+                    std::vector<int> nxt;
+                    std::array<char, N> stepMark{};
+                    const bool final = step == die;
+                    for (int i : cur) {
+                        const Point p{i % kCols, i / kCols};
+                        const Neighbors& nb = neighbors()[p.x][p.y];
+                        for (int k = 0; k < nb.count; ++k) {
+                            const Point np = nb.cells[k];
+                            const int ni = np.y * kCols + np.x;
+                            if (!final && isBar[ni] && ni != ci) continue;
+                            if (stepMark[ni]) continue;
+                            stepMark[ni] = 1;
+                            nxt.push_back(ni);
+                        }
+                    }
+                    cur = std::move(nxt);
+                }
+                reach[static_cast<size_t>(ci) * 7 + die] = std::move(cur);
+            }
+        }
+
+        std::vector<double> e(N, 1e6);
+        e[indexOf({8, 0})] = 0.0;  // reaching the goal wins, worth 0 more turns
+        for (int iter = 0; iter < 500; ++iter) {
+            std::vector<double> next = e;
+            double maxDelta = 0.0;
+            for (int ci = 0; ci < N; ++ci) {
+                if (!isTrackCell(ci % kCols, ci / kCols)) continue;
+                if (isGoalCell(ci % kCols, ci / kCols)) continue;
+                double turn = 0.0;
+                for (int die = 1; die <= 6; ++die) {
+                    double best = 50.0;  // fallback for a roll with no landing
+                    for (int i : reach[static_cast<size_t>(ci) * 7 + die]) {
+                        if (isGoalCell(i % kCols, i / kCols)) {
+                            best = 0.0;
+                            break;
+                        }
+                        if (e[i] < best) best = e[i];
+                    }
+                    turn += best;
+                }
+                const double v = 1.0 + turn / 6.0;
+                next[ci] = v;
+                maxDelta = std::max(maxDelta, std::abs(v - e[ci]));
+            }
+            e = std::move(next);
+            if (maxDelta < 1e-6) break;
+        }
+        return e;
+    }();
+    return e;
+}
+
 int pawnDistToGoal(const std::vector<int>& dist, const Game& g, int player, int pawn) {
     if (g.pawnInBase(player, pawn)) {
         const int d = distAt(dist, baseFrontCell(player));
         return d == kInf ? kInf : d + 1;
     }
     return distAt(dist, g.pawnPos(player, pawn));
+}
+
+// Effective turns left for one pawn: the static expected-turn map shifted by
+// the detour (in weighted steps) imposed by the barricades currently on the
+// board. This is the distance that near-goal positions should be scored by,
+// where the exact-dice rule makes raw steps mislead.
+double pawnExpectedTurns(const Game& g, int player, int pawn,
+                         const std::vector<int>& dist) {
+    const int d = pawnDistToGoal(dist, g, player, pawn);
+    if (d == kInf) return 1e6;
+    const int w = pawnDistToGoal(goalDist(), g, player, pawn);
+    Point p = g.pawnPos(player, pawn);
+    if (g.pawnInBase(player, pawn)) p = baseFrontCell(player);
+    const double es = expectedTurns()[indexOf(p)];
+    if (es >= 1e4) return static_cast<double>(d);
+    const double shift = static_cast<double>(d - w);
+    double turns = es + shift;
+    if (g.pawnInBase(player, pawn)) turns += 1.0;  // exiting the base takes a turn
+    return turns;
 }
 
 int progress(const Game& g, int player, const std::vector<int>& dist) {
@@ -233,14 +334,13 @@ int progress(const Game& g, int player, const std::vector<int>& dist) {
 double heuristicEval(const Game& g, int rootPlayer, const std::vector<int>& dist) {
     if (g.isOver()) return g.winner() == rootPlayer ? 1.0 : -1.0;
 
-    const auto& raw = rawGoalDist();
     int myD[kPawnsPerPlayer];
     int oppD[kMaxPlayers * kPawnsPerPlayer];
     int nOpp = 0;
     int myMin = kInf;
     int oppMin = kInf;
-    int myOne = kInf;  // exact number of steps to the goal (unweighted BFS)
-    int oppOne = kInf;
+    double myE = 1e9;  // expected turns left (exact-dice), closest pawn
+    double oppE = 1e9;
     double mySum = 0.0;
     double oppSum = 0.0;
     int myOut = 0;
@@ -252,7 +352,7 @@ double heuristicEval(const Game& g, int rootPlayer, const std::vector<int>& dist
             mySum += 1.0 / (d + 1.0);
             myMin = std::min(myMin, d);
         }
-        myOne = std::min(myOne, pawnDistToGoal(raw, g, rootPlayer, m));
+        myE = std::min(myE, pawnExpectedTurns(g, rootPlayer, m, dist));
         if (!g.pawnInBase(rootPlayer, m)) ++myOut;
     }
     for (int p = 0; p < g.playerCount(); ++p) {
@@ -265,23 +365,24 @@ double heuristicEval(const Game& g, int rootPlayer, const std::vector<int>& dist
                 oppSum += 1.0 / (d + 1.0);
                 oppMin = std::min(oppMin, d);
             }
-            oppOne = std::min(oppOne, pawnDistToGoal(raw, g, p, m));
+            oppE = std::min(oppE, pawnExpectedTurns(g, p, m, dist));
             if (!g.pawnInBase(p, m)) ++oppOut;
         }
     }
     if (myMin == kInf) myMin = 30;
     if (oppMin == kInf) oppMin = 30;
 
-    // A pawn within a single die roll of the goal (raw distance: the goal can
-    // never be barricaded) is a near-win; the linear terms alone would only
-    // score it as a small lead. Give it a large bonus that grows as it gets
-    // closer. Only an actual win (isOver above) is worth exactly 100%.
-    const int kWinRange = 6;
-    if (myOne <= kWinRange && myOne < oppOne) {
-        return 0.98 - 0.04 * myOne;  // 1 step -> 0.94, 6 steps -> 0.74
+    // Near-win judged by expected turns. The exact-dice rule makes the last
+    // few cells before the goal cost several turns (a pawn one cell before the
+    // gate only gets through on odd rolls, spending even rolls bouncing off
+    // it), so a raw-step near-goal lead is overstated. Only an actual win
+    // (isOver above) is worth exactly 100%.
+    constexpr double kWinRange = 6.0;
+    if (myE <= kWinRange && myE + 2.0 < oppE) {
+        return 0.98 - 0.04 * myE;  // 2 turns -> 0.90, 6 turns -> 0.74
     }
-    if (oppOne <= kWinRange && oppOne < myOne) {
-        return -(0.98 - 0.04 * oppOne);
+    if (oppE <= kWinRange && oppE + 2.0 < myE) {
+        return -(0.98 - 0.04 * oppE);
     }
 
     // Capture adjacency: pawns racing within ~1 step of goal-distance of each
@@ -892,26 +993,31 @@ std::vector<int> playerArmyDistances(const Game& game, int player) {
     return out;
 }
 
-// Estimated win probabilities per player from the whole army: each pawn on
-// the track contributes 1/(dist+2), so advancing and having more pawns out of
-// the base improves the estimate (the curve is slightly sharper than the old
-// 1/(dist+3) to reward end-game proximity). Normalized so the shares sum to 1.
-// A player one exact step from the goal (and nobody else that close) is
-// resolved as a sure win, since the curve alone would only read ~40% for it.
+// Estimated win probabilities per player from the whole army. The per-pawn
+// weight is 1/(turns+2) where `turns` is the expected number of turns left
+// (exact-dice), so advancing and having more pawns out of the base improves
+// the estimate, and near-goal positions are judged by the turns they still
+// need, not by the cells left. Normalized so the shares sum to 1. A player
+// whose closest pawn is within ~3 turns while everyone else is 8+ turns
+// behind is resolved as a sure win, since the curve alone would only read
+// ~40% for it.
 std::vector<double> winChances(const Game& game) {
-    const auto& raw = rawGoalDist();
-    int leader = -1;
+    const auto dist = buildGoalDistDynamic(currentBarricades(game));
+    double bestE[kMaxPlayers];
+    int leader = 0;
     for (int p = 0; p < game.playerCount(); ++p) {
-        int best = kInf;
+        double b = 1e9;
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
-            best = std::min(best, pawnDistToGoal(raw, game, p, m));
+            b = std::min(b, pawnExpectedTurns(game, p, m, dist));
         }
-        if (best == 1) {
-            if (leader >= 0) leader = -2;  // two players one step away: fall through
-            else leader = p;
-        }
+        bestE[p] = b;
+        if (b < bestE[leader]) leader = p;
     }
-    if (leader >= 0) {
+    double secondE = 1e9;
+    for (int p = 0; p < game.playerCount(); ++p) {
+        if (p != leader) secondE = std::min(secondE, bestE[p]);
+    }
+    if (bestE[leader] <= 3.0 && secondE - bestE[leader] >= 8.0) {
         std::vector<double> out(game.playerCount(), 0.0);
         out[leader] = 0.95;  // big bonus for the near-win, not a sure 100%
         const double rest = 0.05 / (game.playerCount() - 1);
@@ -922,13 +1028,12 @@ std::vector<double> winChances(const Game& game) {
     }
 
     std::vector<double> out(game.playerCount());
-    const auto dist = buildGoalDistDynamic(currentBarricades(game));
     for (int p = 0; p < game.playerCount(); ++p) {
         double s = 0.0;
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
-            int d = pawnDistToGoal(dist, game, p, m);
-            if (d > 24) d = 24;
-            s += 1.0 / (d + 2.0);
+            double t = pawnExpectedTurns(game, p, m, dist);
+            if (t > 24.0) t = 24.0;
+            s += 1.0 / (t + 2.0);
         }
         out[p] = s;
     }
@@ -1213,7 +1318,7 @@ static Point simBarricadePlacement(const Game& game, const std::vector<int>& dis
     std::vector<GainCand> cands = gainBarricadeCandidates(game, dist);
     std::sort(cands.begin(), cands.end(),
               [](const GainCand& a, const GainCand& b) { return a.gain > b.gain; });
-    if (cands.size() > 4) cands.resize(static_cast<size_t>(4));
+    if (cands.size() > 2) cands.resize(static_cast<size_t>(2));
     if (cands.empty()) return fastBarricadePlacement(game, dist);
     const auto baseDist = baseGoalDist(game);
     Point best = cands[0].c;
@@ -1250,9 +1355,14 @@ static int simulateOneGame(const Game& g, std::mt19937& rng) {
             if (mv.pawn >= 0) {
                 sim.movePawnFast(sim.currentPlayer(), mv.pawn, mv.dest);
                 if (sim.pendingBarricade()) {
-                    // the captured wall is gone; the placement below must not
-                    // keep routing around it
-                    dist = buildGoalDistDynamic(currentBarricades(sim));
+                    // The captured wall is gone; the placement below must not
+                    // keep routing around it. A wall taken from one of its
+                    // initial cells changes nothing for the distance map (the
+                    // cell keeps its static penalty either way), so skip the
+                    // recompute there.
+                    if (!isInitialBarricadeCell(mv.dest.x, mv.dest.y)) {
+                        dist = buildGoalDistDynamic(currentBarricades(sim));
+                    }
                 }
             } else {
                 sim.nextTurn();  // no legal move: turn skipped
