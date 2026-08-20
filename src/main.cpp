@@ -1281,6 +1281,11 @@ int main(int argc, char* argv[]) {
     }
     const auto isAi = [&humanCount](int p) { return p >= humanCount; };
     constexpr int kAiBudget = 1000;           // ms of MCTS search per AI move
+    // Background end-game sim: cap its workers so the MCTS search and the UI
+    // keep a fair share of the cores (it is ~9x faster since the gain-only
+    // placement, so half the cores is still plenty).
+    const int kSimThreads =
+        std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
     constexpr Uint32 kAiPace = 330;           // min ms between two AI actions
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -1456,7 +1461,7 @@ int main(int argc, char* argv[]) {
         simRun.th = std::thread([snapshot, &simRun] {
             barricade::simulateWinChancesAsync(snapshot, 1000000000LL, &simRun.stop,
                                                simRun.wins.data(), snapshot.playerCount(),
-                                               &simRun.games, 0);
+                                               &simRun.games, kSimThreads);
         });
     };
     const auto stopSim = [&] {
@@ -1471,7 +1476,7 @@ int main(int argc, char* argv[]) {
         simRun.th = std::thread([snapshot, &simRun] {
             barricade::simulateWinChancesAsync(snapshot, 1000000000LL, &simRun.stop,
                                                simRun.wins.data(), snapshot.playerCount(),
-                                               &simRun.games, 0);
+                                               &simRun.games, kSimThreads);
         });
     };
     const auto toggleSim = [&] {
@@ -1686,6 +1691,10 @@ int main(int argc, char* argv[]) {
                     aiNextAt = SDL_GetTicks() + kAiPace;
                 } else if (SDL_GetTicks() >= aiNextAt) {
                     selectedPawn = -1;
+                    // Stop the background sim so the search gets the machine's
+                    // cores to itself; the position changes right after the
+                    // move anyway, so its running estimate would be stale.
+                    stopSim();
                     const barricade::Game snapshot = game;
                     aiBusy = true;
                     aiHaveResult = false;
