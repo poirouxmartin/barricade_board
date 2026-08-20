@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <queue>
 #include <random>
 #include <thread>
 #include <utility>
@@ -174,24 +175,20 @@ std::vector<int> buildGoalDistDynamic(const std::vector<Point>& blocked) {
     for (const Point& b : blocked) isBlocked[indexOf(b)] = 1;
 
     std::vector<int> dist(kCols * kRows, kInf);
-    std::vector<char> done(kCols * kRows, 0);
     const Point goal{8, 0};
-    dist[indexOf(goal)] = 0;
+    const int goalIdx = indexOf(goal);
+    dist[goalIdx] = 0;
+    using Item = std::pair<int, int>;  // (distance, cell index)
+    std::priority_queue<Item, std::vector<Item>, std::greater<Item>> pq;
+    pq.push({0, goalIdx});
 
     const int dx[4] = {1, -1, 0, 0};
     const int dy[4] = {0, 0, 1, -1};
-    for (;;) {
-        int best = -1;
-        int bestDist = kInf;
-        for (int i = 0; i < kCols * kRows; ++i) {
-            if (!done[i] && dist[i] < bestDist) {
-                bestDist = dist[i];
-                best = i;
-            }
-        }
-        if (best < 0) break;
-        done[best] = 1;
-        const Point cur{best % kCols, best / kCols};
+    while (!pq.empty()) {
+        const auto [d, i] = pq.top();
+        pq.pop();
+        if (d != dist[i]) continue;  // stale heap entry
+        const Point cur{i % kCols, i / kCols};
         for (int k = 0; k < 4; ++k) {
             const Point np{cur.x + dx[k], cur.y + dy[k]};
             if (!isTrackCell(np.x, np.y)) continue;
@@ -199,8 +196,11 @@ std::vector<int> buildGoalDistDynamic(const std::vector<Point>& blocked) {
             const int cost = 1 + ((isInitialBarricadeCell(np.x, np.y) || isBlocked[ni])
                                       ? kBarricadePenalty
                                       : 0);
-            const int nd = bestDist + cost;
-            if (nd < dist[ni]) dist[ni] = nd;
+            const int nd = d + cost;
+            if (nd < dist[ni]) {
+                dist[ni] = nd;
+                pq.push({nd, ni});
+            }
         }
     }
     return dist;
@@ -1202,21 +1202,58 @@ std::vector<BarricadeRecommendation> barricadeRecommendations(const Game& game, 
     return out;
 }
 
+// Placement for the end-game simulator only (the Monte-Carlo rollouts keep the
+// cheap gain-only `fastBarricadePlacement` for speed). The gain model ignores
+// the placer's own pawns by design, so it would happily wall in its own
+// reinforcements; refining the top few gain candidates with the exact BFS
+// scorer (which charges the placer -1000 for a wall that traps an own pawn)
+// keeps the simulator's placements self-aware. The exact scorer is cheap, so
+// this runs once per captured barricade.
+static Point simBarricadePlacement(const Game& game, const std::vector<int>& dist) {
+    std::vector<GainCand> cands = gainBarricadeCandidates(game, dist);
+    std::sort(cands.begin(), cands.end(),
+              [](const GainCand& a, const GainCand& b) { return a.gain > b.gain; });
+    if (cands.size() > 4) cands.resize(static_cast<size_t>(4));
+    if (cands.empty()) return fastBarricadePlacement(game, dist);
+    const auto baseDist = baseGoalDist(game);
+    Point best = cands[0].c;
+    int bestScore = -kInf;
+    for (const GainCand& cd : cands) {
+        const int s = scoreBarricade(game, baseDist, cd.c);
+        if (s > bestScore) {
+            bestScore = s;
+            best = cd.c;
+        }
+    }
+    return best;
+}
+
 // Plays one full end-game from `g` (which must be mid-turn: either dice rolled
 // or a barricade pending) and returns the winner, or -1 if the turn cap was hit.
 static int simulateOneGame(const Game& g, std::mt19937& rng) {
     Game sim = g;
-    const auto dist = buildGoalDistDynamic(currentBarricades(g));
+    std::vector<int> dist = buildGoalDistDynamic(currentBarricades(g));
     for (int turns = 0; turns < 5000; ++turns) {
         if (sim.isOver()) return sim.winner();
         if (sim.pendingBarricade()) {
-            sim.placeBarricadeFast(fastBarricadePlacement(sim, dist));
+            sim.placeBarricadeFast(simBarricadePlacement(sim, dist));
+            // Walls moved under the policy's feet: recompute the distances so
+            // the next moves and placements see the new board. A stale map made
+            // the greedy pawns route through freshly placed walls (rushing into
+            // them and churning by re-capturing them), under-crediting blocks in
+            // the end-game estimates.
+            dist = buildGoalDistDynamic(currentBarricades(sim));
         } else if (sim.dice() == 0) {
             sim.startTurn();
         } else {
             const AIMove mv = cheapMove(sim, sim.currentPlayer(), rng, dist);
             if (mv.pawn >= 0) {
                 sim.movePawnFast(sim.currentPlayer(), mv.pawn, mv.dest);
+                if (sim.pendingBarricade()) {
+                    // the captured wall is gone; the placement below must not
+                    // keep routing around it
+                    dist = buildGoalDistDynamic(currentBarricades(sim));
+                }
             } else {
                 sim.nextTurn();  // no legal move: turn skipped
             }
