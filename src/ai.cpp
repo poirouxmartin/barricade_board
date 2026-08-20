@@ -1026,6 +1026,11 @@ std::vector<GainCand> gainBarricadeCandidates(const Game& game,
     out.reserve(160);
     for (const Point& c : pt.rank) {
         if (game.barricadeAt(c) || game.pawnAt(c) != -1) continue;
+        // (8,1) is the only gate to the goal: a wall there seals the goal for
+        // everyone including the placer, and the gain model (which ignores the
+        // placer's own pawns) would always rank it first and re-seal the goal
+        // whenever a pawn captures it, stalling the nearest player forever.
+        if (c.x == 8 && c.y == 1) continue;
         const int cg = distAt(dist, c);
         if (cg == kInf) continue;
 
@@ -1080,10 +1085,12 @@ Point fastBarricadePlacement(const Game& game, const std::vector<int>& dist) {
         }
     }
     if (bestGain > 0) return best;
-    // Very crowded board: nothing scored, return the first legal cell.
+    // Very crowded board: nothing scored, return the first legal cell (never
+    // the goal gate (8,1), which would seal the goal for everyone).
     const PlacementTables& pt = placementTables();
     for (const Point& c : pt.rank) {
-        if (!game.barricadeAt(c) && game.pawnAt(c) == -1) return c;
+        if ((c.x == 8 && c.y == 1) || game.barricadeAt(c) || game.pawnAt(c) != -1) continue;
+        return c;
     }
     return {0, 0};
 }
@@ -1091,10 +1098,12 @@ Point fastBarricadePlacement(const Game& game, const std::vector<int>& dist) {
 Point cheapBarricadePlacement(const Game& game, const std::vector<int>& dist) {
     const std::vector<Point> cands = cheapBarricadeCandidates(game, 1, dist);
     if (!cands.empty()) return cands[0];
-    // Very crowded board: nothing scored, return the first legal cell.
+    // Very crowded board: nothing scored, return the first legal cell (never
+    // the goal gate (8,1)).
     const PlacementTables& pt = placementTables();
     for (const Point& c : pt.rank) {
-        if (!game.barricadeAt(c) && game.pawnAt(c) == -1) return c;
+        if ((c.x == 8 && c.y == 1) || game.barricadeAt(c) || game.pawnAt(c) != -1) continue;
+        return c;
     }
     return {0, 0};
 }

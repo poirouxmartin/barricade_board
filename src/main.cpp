@@ -369,6 +369,7 @@ struct ScenarioView {
     barricade::Point cell{-1, -1};   // barricade placement (mode 2)
     bool isPlacement = false;
     double value = 0.0;              // MCTS value or barricade score
+    double placementScore = 0.0;     // exact BFS score (mode 2 placements)
     long long visits = 0;            // MCTS visits (mode 1)
     std::vector<double> shares;      // per-player end-game win shares
     long long sims = 0;              // end-game games played for the shares
@@ -431,9 +432,21 @@ void engineLoop(AnalysisEngine& E) {
             // Both modes search with the MCTS: a move node (mode 1) returns the
             // best pawn moves, a placement node (mode 2, a captured barricade
             // pending) returns the best placements. Each is then scored by a
-            // 2000-game position simulation.
+            // fixed-size position simulation.
             std::vector<ScenarioView> sc;
             const auto dist = barricade::dynamicGoalDist(snapshot);
+            // Exact BFS placement scores: they account for the damage a wall
+            // does to our own pawns, which the greedy sim around the goal gate
+            // does not, so placement advice ranks them first.
+            const auto exact = mode == 2
+                                   ? barricade::barricadeRecommendations(snapshot, 6)
+                                   : std::vector<barricade::BarricadeRecommendation>{};
+            const auto exactScore = [&exact](const barricade::Point& c) {
+                for (const auto& br : exact) {
+                    if (br.cell.x == c.x && br.cell.y == c.y) return br.score;
+                }
+                return 0.0;  // not in the exact top-N: unknown score
+            };
             const auto recs = barricade::mctsRecommendations(
                 snapshot, snapshot.currentPlayer(), static_cast<int>(budget));
             for (const auto& rec : recs) {
@@ -445,6 +458,7 @@ void engineLoop(AnalysisEngine& E) {
                     sv.cell = rec.move.dest;
                     sv.isPlacement = true;
                     sv.value = rec.value;
+                    sv.placementScore = exactScore(rec.move.dest);
                     sv.visits = rec.visits;
                     sv.shares = barricade::simulateWinChances(child, 5000);
                     sv.sims = 5000;
@@ -471,11 +485,6 @@ void engineLoop(AnalysisEngine& E) {
                 }
             }
             if (mode == 2) {
-                // Also offer the exact BFS scorer's best cells: the MCTS
-                // placement branch is capped at kBarricadeBranch cells, and a
-                // good manual block could rank lower in that shortlist while
-                // still scoring well when simulated.
-                const auto exact = barricade::barricadeRecommendations(snapshot, 6);
                 for (const auto& br : exact) {
                     bool dup = false;
                     for (const ScenarioView& sv : sc) {
@@ -491,22 +500,28 @@ void engineLoop(AnalysisEngine& E) {
                     sv.cell = br.cell;
                     sv.isPlacement = true;
                     sv.value = 0.0;
+                    sv.placementScore = br.score;
                     sv.visits = 0;
                     sv.shares = barricade::simulateWinChances(child, 5000);
                     sv.sims = 5000;
                     sc.push_back(std::move(sv));
                 }
             }
-            // Rank the scenarios by the current player's simulated win share:
-            // the MCTS visits and the 2000-game position simulation are two
-            // different estimators, and the share is the one the UI displays.
+            // Rank: placement advice by the exact BFS score first (a wall that
+            // merely sits next to our leader looks good to the noisy greedy
+            // sim, but the exact scorer sees it hurts our own pawns), then by
+            // the simulated share the UI displays.
             {
                 const int cp = snapshot.currentPlayer();
-                std::sort(sc.begin(), sc.end(), [cp](const ScenarioView& a, const ScenarioView& b) {
-                    const double as = !a.shares.empty() ? a.shares[cp] : -1.0;
-                    const double bs = !b.shares.empty() ? b.shares[cp] : -1.0;
-                    return as > bs;
-                });
+                std::sort(sc.begin(), sc.end(),
+                          [cp, mode](const ScenarioView& a, const ScenarioView& b) {
+                              if (mode == 2 && a.placementScore != b.placementScore) {
+                                  return a.placementScore > b.placementScore;
+                              }
+                              const double as = !a.shares.empty() ? a.shares[cp] : -1.0;
+                              const double bs = !b.shares.empty() ? b.shares[cp] : -1.0;
+                              return as > bs;
+                          });
             }
             {
                 std::lock_guard<std::mutex> guard(E.m);
@@ -555,6 +570,8 @@ void drawAdviceOverlay(SDL_Renderer* r, TTF_Font* font, const barricade::Game& g
     const size_t n = std::min<size_t>(advice.scenarios.size(), 4);
     const bool placementMode = !advice.scenarios.empty() && advice.scenarios[0].isPlacement;
     if (placementMode) {
+        // a wall with no exact value is "no useful block": show nothing
+        if (advice.scenarios[0].placementScore <= 0) return;
         // numbered placement badges on the recommended cells
         for (size_t i = 0; i < n; ++i) {
             const auto& sv = advice.scenarios[i];
@@ -889,8 +906,12 @@ std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)
     if (match && !advice.busy) {
         char line[64];
         if (analysisMode == 2 && !advice.scenarios.empty()) {
-            std::snprintf(line, sizeof line, "Bloc -> (%d,%d)",
-                          advice.scenarios[0].cell.x, advice.scenarios[0].cell.y);
+            if (advice.scenarios[0].placementScore > 0) {
+                std::snprintf(line, sizeof line, "Bloc -> (%d,%d)",
+                              advice.scenarios[0].cell.x, advice.scenarios[0].cell.y);
+            } else {
+                std::snprintf(line, sizeof line, "Aucun bloc utile");
+            }
             strategy = line;
         } else if (!advice.scenarios.empty()) {
             const auto& sv = advice.scenarios[0];
@@ -906,8 +927,12 @@ std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)
             }
             strategy = line;
         } else if (analysisMode == 2 && !advice.placements.empty()) {
-            std::snprintf(line, sizeof line, "Bloc -> (%d,%d)",
-                          advice.placements[0].cell.x, advice.placements[0].cell.y);
+            if (advice.placements[0].score > 0) {
+                std::snprintf(line, sizeof line, "Bloc -> (%d,%d)",
+                              advice.placements[0].cell.x, advice.placements[0].cell.y);
+            } else {
+                std::snprintf(line, sizeof line, "Aucun bloc utile");
+            }
             strategy = line;
         } else if (!advice.moves.empty()) {
             const auto& rec = advice.moves[0];
@@ -985,8 +1010,12 @@ std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)
             const auto& sv = advice.scenarios[i];
             char line[64];
             if (sv.isPlacement) {
-                std::snprintf(line, sizeof line, "#%d  Bloc -> (%d,%d)", static_cast<int>(i) + 1,
-                              sv.cell.x, sv.cell.y);
+                if (sv.placementScore > 0) {
+                    std::snprintf(line, sizeof line, "#%d  Bloc -> (%d,%d)", static_cast<int>(i) + 1,
+                                  sv.cell.x, sv.cell.y);
+                } else {
+                    std::snprintf(line, sizeof line, "#%d  (aucun bloc utile)", static_cast<int>(i) + 1);
+                }
             } else {
                 std::snprintf(line, sizeof line, "#%d  P%d -> (%d,%d)", static_cast<int>(i) + 1,
                               sv.move.pawn + 1, sv.move.dest.x, sv.move.dest.y);
@@ -994,7 +1023,7 @@ std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)
             setColor(r, kAdvicePalette[i % 8]);
             fillCircle(r, box.x + 18, yy + 8, 6);
             renderText(r, small, line, box.x + 30, yy, kTextColor);
-            // Coherent with the shares shown below: both come from the 2000-game
+            // Coherent with the shares shown below: both come from the fixed-size
             // position simulation (the MCTS visits are a different estimator).
             const long long sims = sv.sims;
             std::snprintf(line, sizeof line, "%s sims", groupThousands(sims).c_str());
