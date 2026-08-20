@@ -44,6 +44,10 @@ std::vector<Point> currentBarricades(const Game& game);
 // the cheap candidate scorer uses it to refine its shortlist.
 int scoreBarricade(const Game& game, const std::vector<int>& baseDist, Point c);
 
+// Gain-only placement used by the Monte-Carlo loops (rollouts and the
+// win-chance simulation), defined below: no exact BFS refinement.
+Point fastBarricadePlacement(const Game& game, const std::vector<int>& dist);
+
 // Goal BFS base distances for the placement scores (defined below): current
 // barricades except the goal-adjacent (8,1), which would make them all kInf.
 const std::vector<int> baseGoalDist(const Game& game);
@@ -439,7 +443,7 @@ double rollout(const Game& g0, int rootPlayer, std::mt19937& rng,
     Game g = g0;
     for (int step = 0; step < kRolloutSteps && !g.isOver(); ++step) {
         if (g.pendingBarricade()) {
-            g.placeBarricadeFast(cheapBarricadePlacement(g, dist));
+            g.placeBarricadeFast(fastBarricadePlacement(g, dist));
         } else if (g.dice() == 0) {
             g.startTurn();
         } else {
@@ -994,8 +998,19 @@ const PlacementTables& placementTables() {
 // tree descent can call it through the forward declaration above.
 namespace {
 
-std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
-                                            const std::vector<int>& dist) {
+// Gain-only prefilter shared by the exact candidate list and the fast rollout
+// placement: ranks every free track cell by how many opponents it slows down
+// (choke points and cells near the goal weighted more). It deliberately ignores
+// our own pawns: the distance model cannot tell a block on the opponent's side
+// from a block on our side, so penalizing our own pawns here could drop the
+// clean block out of the shortlist before the exact scorer sees it.
+struct GainCand {
+    Point c;
+    int gain;
+};
+
+std::vector<GainCand> gainBarricadeCandidates(const Game& game,
+                                              const std::vector<int>& dist) {
     const PlacementTables& pt = placementTables();
 
     int opDist[kMaxPlayers * kPawnsPerPlayer];
@@ -1007,23 +1022,14 @@ std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
         }
     }
 
-    struct Cand {
-        Point c;
-        int score;
-    };
-    std::vector<Cand> cands;
-    cands.reserve(160);
+    std::vector<GainCand> out;
+    out.reserve(160);
     for (const Point& c : pt.rank) {
         if (game.barricadeAt(c) || game.pawnAt(c) != -1) continue;
         const int cg = distAt(dist, c);
         if (cg == kInf) continue;
 
         const int fwd = pt.fwd[indexOf(c)];
-        // The cheap prefilter ranks cells by how many opponents they slow down
-        // (weighted more near the goal). It deliberately ignores our own pawns:
-        // the distance model cannot tell a block on the opponent's side from a
-        // block on our side, so penalizing our own pawns here could drop the
-        // clean block out of the shortlist before the exact scorer sees it.
         const int oppImpact = (fwd == 1) ? 50 : 4;
 
         int gain = 0;
@@ -1032,18 +1038,24 @@ std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
                 gain += oppImpact * (opDist[i] <= 8 ? 2 : 1);
             }
         }
-        cands.push_back({c, gain});
+        out.push_back({c, gain});
     }
+    return out;
+}
+
+std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
+                                            const std::vector<int>& dist) {
+    std::vector<GainCand> cands = gainBarricadeCandidates(game, dist);
     std::sort(cands.begin(), cands.end(),
-              [](const Cand& a, const Cand& b) { return a.score > b.score; });
+              [](const GainCand& a, const GainCand& b) { return a.gain > b.gain; });
     if (cands.size() > 16) cands.resize(16);
     // Refine the shortlist with the exact BFS scorer: it measures the real
     // detour (or trap) for every pawn, so a clean block of the opponents wins
     // without penalizing our own route.
     const auto baseDist = baseGoalDist(game);
-    for (Cand& cd : cands) cd.score = scoreBarricade(game, baseDist, cd.c);
+    for (GainCand& cd : cands) cd.gain = scoreBarricade(game, baseDist, cd.c);
     std::sort(cands.begin(), cands.end(),
-              [](const Cand& a, const Cand& b) { return a.score > b.score; });
+              [](const GainCand& a, const GainCand& b) { return a.gain > b.gain; });
     std::vector<Point> out;
     for (size_t i = 0; i < cands.size() && out.size() < static_cast<size_t>(K); ++i) {
         out.push_back(cands[i].c);
@@ -1052,6 +1064,29 @@ std::vector<Point> cheapBarricadeCandidates(const Game& game, int K,
 }
 
 }  // namespace
+
+// Fast placement for the Monte-Carlo loops: the gain prefilter alone, no exact
+// BFS refinement. Every capture triggers a placement, so the 16 refinements of
+// the exact path would dominate their cost, and a slightly cruder placement
+// policy is fine for a sample.
+Point fastBarricadePlacement(const Game& game, const std::vector<int>& dist) {
+    std::vector<GainCand> cands = gainBarricadeCandidates(game, dist);
+    Point best{0, 0};
+    int bestGain = 0;
+    for (const GainCand& cd : cands) {
+        if (cd.gain > bestGain) {
+            bestGain = cd.gain;
+            best = cd.c;
+        }
+    }
+    if (bestGain > 0) return best;
+    // Very crowded board: nothing scored, return the first legal cell.
+    const PlacementTables& pt = placementTables();
+    for (const Point& c : pt.rank) {
+        if (!game.barricadeAt(c) && game.pawnAt(c) == -1) return c;
+    }
+    return {0, 0};
+}
 
 Point cheapBarricadePlacement(const Game& game, const std::vector<int>& dist) {
     const std::vector<Point> cands = cheapBarricadeCandidates(game, 1, dist);
@@ -1166,7 +1201,7 @@ static int simulateOneGame(const Game& g, std::mt19937& rng) {
     for (int turns = 0; turns < 5000; ++turns) {
         if (sim.isOver()) return sim.winner();
         if (sim.pendingBarricade()) {
-            sim.placeBarricadeFast(cheapBarricadePlacement(sim, dist));
+            sim.placeBarricadeFast(fastBarricadePlacement(sim, dist));
         } else if (sim.dice() == 0) {
             sim.startTurn();
         } else {

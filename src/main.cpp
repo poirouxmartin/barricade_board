@@ -812,9 +812,13 @@ std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)
         }
         for (int p = 0; p < game.playerCount(); ++p) {
             setColor(r, kPlayerColors[p]);
+            // 1px horizontal offset per player so coincident curves (the shares
+            // are complementary and can sit exactly on each other) stay visible.
+            const int pxo = p & 1;
             int px = -1, py = -1;
             for (int i = 0; i < histN; ++i) {
-                const int x = plot.x + (i * (plot.w - 1)) / std::max(histN - 1, 1);
+                const int x = std::min(plot.x + (i * (plot.w - 1)) / std::max(histN - 1, 1) + pxo,
+                                       plot.x + plot.w - 1);
                 const double v = (i < static_cast<int>(winHist[i].size())) ? winHist[i][p] : 0.0;
                 const int y = yof(v);
                 if (px >= 0) drawLine(r, px, py, x, y);
@@ -823,7 +827,8 @@ std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)
             }
             // sample dots: visible even when a single move jumps the curve
             for (int i = 0; i < histN; ++i) {
-                const int x = plot.x + (i * (plot.w - 1)) / std::max(histN - 1, 1);
+                const int x = std::min(plot.x + (i * (plot.w - 1)) / std::max(histN - 1, 1) + pxo,
+                                       plot.x + plot.w - 1);
                 const double v = (i < static_cast<int>(winHist[i].size())) ? winHist[i][p] : 0.0;
                 const int y = yof(v);
                 SDL_RenderDrawPoint(r, x, y);
