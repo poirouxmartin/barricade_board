@@ -5,6 +5,28 @@
 
 namespace barricade {
 
+namespace {
+std::vector<std::string> splitTok(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    for (;;) {
+        const size_t end = s.find(sep, pos);
+        out.push_back(s.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+        if (end == std::string::npos) break;
+        pos = end + 1;
+    }
+    return out;
+}
+
+bool parsePoint(const std::string& t, Point& p) {
+    const size_t c = t.find(',');
+    if (c == std::string::npos) return false;
+    p.x = std::atoi(t.substr(0, c).c_str());
+    p.y = std::atoi(t.substr(c + 1).c_str());
+    return true;
+}
+}  // namespace
+
 int rollDie() {
     static std::random_device rd;
     static std::mt19937 rng(rd());
@@ -321,4 +343,163 @@ void Game::clearBarricade(Point p) {
     barricade_grid_[i >> 6] &= ~(1ULL << (i & 63));
 }
 
+std::string Game::savePosition() const {
+    std::string s = "barricade";
+    s += ";N=" + std::to_string(player_count_);
+    s += ";turn=" + std::to_string(current_);
+    s += ";dice=" + std::to_string(dice_);
+    s += ";hand=" + std::to_string(pending_barricade_ ? 1 : 0);
+    s += ";over=" + std::to_string(over_ ? 1 : 0);
+    s += ";winner=" + std::to_string(winner_);
+    for (int p = 0; p < player_count_; ++p) {
+        s += ";P" + std::to_string(p) + "=";
+        for (int m = 0; m < kPawnsPerPlayer; ++m) {
+            if (m) s += '|';
+            const Point c = pawns_[p][m];
+            if (c.x < 0) {
+                s += '-';
+            } else {
+                s += std::to_string(c.x) + "," + std::to_string(c.y);
+            }
+        }
+    }
+    s += ";bars=";
+    bool first = true;
+    for (const Point& b : barricades_) {
+        if (b.x < 0) continue;
+        if (!first) s += '|';
+        s += std::to_string(b.x) + "," + std::to_string(b.y);
+        first = false;
+    }
+    s += ";act=" + std::to_string(actions_);
+    return s;
+}
+
+bool Game::loadPosition(const std::string& text) {
+    reset();
+
+    int players = -1;
+    int turn = -1;
+    int dice = -1;
+    int hand = 0;
+    int act = 0;
+    bool over = false;
+    int winner = -1;
+    Point pawnsIn[kMaxPlayers][kPawnsPerPlayer];
+    for (int p = 0; p < kMaxPlayers; ++p) {
+        for (int m = 0; m < kPawnsPerPlayer; ++m) pawnsIn[p][m] = {-1, -1};
+    }
+    std::vector<Point> bars;
+
+    bool ok = true;
+    std::vector<std::string> toks = splitTok(text, ';');
+    if (toks.empty() || toks[0] != "barricade") ok = false;
+    for (size_t i = 1; ok && i < toks.size(); ++i) {
+        const std::string& t = toks[i];
+        const size_t eq = t.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = t.substr(0, eq);
+        const std::string v = t.substr(eq + 1);
+if (k == "N") {
+            players = std::atoi(v.c_str());
+            if (players < 2 || players > kMaxPlayers) ok = false;
+        } else if (k == "turn") {
+            turn = std::atoi(v.c_str());
+        } else if (k == "dice") {
+            dice = std::atoi(v.c_str());
+            if (dice < 0 || dice > 6) ok = false;
+        } else if (k == "hand") {
+            hand = std::atoi(v.c_str());
+            if (hand != 0 && hand != 1) ok = false;
+        } else if (k == "act") {
+            act = std::atoi(v.c_str());
+        } else if (k == "over") {
+            over = std::atoi(v.c_str()) != 0;
+} else if (k == "winner") {
+            winner = std::atoi(v.c_str());
+        } else if (k.size() == 2 && k[0] == 'P') {
+            const int p = k[1] - '0';
+            if (p < 0 || p >= kMaxPlayers) {
+                ok = false;
+                break;
+            }
+            std::vector<std::string> cells = splitTok(v, '|');
+            if (cells.size() != kPawnsPerPlayer) {
+                ok = false;
+                break;
+            }
+            for (int m = 0; m < kPawnsPerPlayer; ++m) {
+                if (cells[m] == "-") continue;
+                Point c;
+                if (!parsePoint(cells[m], c) || c.x < 0 || c.y < 0 || !isTrackCell(c.x, c.y)) {
+                    ok = false;
+                    break;
+                }
+                pawnsIn[p][m] = c;
+            }
+        } else if (k == "bars") {
+            std::vector<std::string> cells = splitTok(v, '|');
+            for (const std::string& c : cells) {
+                if (c.empty()) continue;
+                Point b;
+                if (!parsePoint(c, b) || !isTrackCell(b.x, b.y) || b.y == kBottomRowY || isGoalCell(b.x, b.y)) {
+                    ok = false;
+                    break;
+                }
+                bars.push_back(b);
+            }
+        }
+    }
+    if (ok) {
+        if (players < 2 || turn < 0 || turn >= players) ok = false;
+        if (hand != 0 && hand != 1) ok = false;
+        if (bars.size() != static_cast<size_t>(kBarricadeCount - hand)) ok = false;
+    }
+    if (!ok) {
+        reset();
+        return false;
+    }
+
+    player_count_ = players;
+    current_ = turn;
+    dice_ = dice;
+    over_ = over;
+    winner_ = winner;
+    pending_barricade_ = hand == 1;
+    captured_barricade_ = -1;
+    actions_ = act;
+    deadlock_ = false;
+
+// Place the barricades exactly as listed; when one is in hand its slot stays
+    // empty and becomes the captured index (barricades are interchangeable).
+    for (int i = 0; i < static_cast<int>(barricade_grid_.size()); ++i) barricade_grid_[i] = 0;
+    for (int i = 0; i < static_cast<int>(barricades_.size()); ++i) barricades_[i] = {-1, -1};
+    for (int i = 0; i < static_cast<int>(bars.size()); ++i) {
+        barricades_[i] = bars[i];
+        setBarricade(bars[i]);
+    }
+    if (hand == 1) {
+        captured_barricade_ = static_cast<int>(bars.size());
+        barricades_[bars.size()] = {-1, -1};
+    }
+
+    for (int p = 0; p < player_count_; ++p) {
+        for (int m = 0; m < kPawnsPerPlayer; ++m) {
+            pawns_[p][m] = pawnsIn[p][m];
+            if (pawnsIn[p][m].x < 0) continue;
+if (pawnAt(pawnsIn[p][m]) != -1) {
+                reset();
+                return false;  // two pawns on the same cell
+            }
+            if (barricadeAt(pawnsIn[p][m])) {
+                reset();
+                return false;  // pawn standing on a placed barricade
+            }
+            setPawn(pawnsIn[p][m], p * kPawnsPerPlayer + m);
+        }
+    }
+    return true;
+}
+
 }  // namespace barricade
+

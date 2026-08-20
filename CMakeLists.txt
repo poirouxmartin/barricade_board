@@ -21,6 +21,8 @@ add_executable(barricade_board
     src/board.cpp
     src/ai.h
     src/ai.cpp
+    src/nn.h
+    src/nn.cpp
 )
 
 target_link_libraries(barricade_board PRIVATE SDL2::SDL2main SDL2::SDL2 SDL2_ttf::SDL2_ttf)
@@ -33,6 +35,48 @@ add_executable(smoke_test
     src/board.cpp
     src/ai.h
     src/ai.cpp
+    src/nn.h
+    src/nn.cpp
 )
 target_include_directories(smoke_test PRIVATE src)
 target_link_libraries(smoke_test PRIVATE)
+
+# Neural-network training pipeline (console tools, no SDL).
+add_executable(selfplay
+    src/selfplay.cpp
+    src/game.h
+    src/game.cpp
+    src/board.h
+    src/board.cpp
+    src/ai.h
+    src/ai.cpp
+    src/nn.h
+    src/nn.cpp
+)
+target_include_directories(selfplay PRIVATE src)
+
+add_executable(train
+    src/train.cpp
+    src/game.h
+    src/game.cpp
+    src/board.h
+    src/board.cpp
+    src/ai.h
+    src/ai.cpp
+    src/nn.h
+    src/nn.cpp
+)
+target_include_directories(train PRIVATE src)
+
+add_executable(bench
+    src/bench.cpp
+    src/game.h
+    src/game.cpp
+    src/board.h
+    src/board.cpp
+    src/ai.h
+    src/ai.cpp
+    src/nn.h
+    src/nn.cpp
+)
+target_include_directories(bench PRIVATE src)

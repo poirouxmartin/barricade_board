@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace barricade {
@@ -56,6 +57,16 @@ public:
     int pawnAt(Point p) const;  // player * kPawnsPerPlayer + pawn, or -1
     bool barricadeAt(Point p) const;
     const std::array<Point, kBarricadeCount>& barricades() const { return barricades_; }
+
+    // Position notation (FEN-like): full game state on a single line so tests
+    // can round-trip positions. Fields are ';'-separated key=value pairs:
+    //   barricade;N=4;turn=0;dice=3;hand=0;over=0;winner=-1;P0=2,13|-|-|-|-;...
+    //   ;P1=...;bars=8,1|8,3|...;act=3
+    // Each player has kPawnsPerPlayer slots ('-' = in base, else x,y). `hand`
+    // is 1 while a barricade is in hand (its cell is absent from `bars`).
+    // `over`/`winner` let a finished game (goal or deadlock) round-trip too.
+    std::string savePosition() const;
+    bool loadPosition(const std::string& text);  // resets the game first; false on parse error
 
 private:
     bool explore(Point cur, Point prev, int steps, Point* out, int& count, int maxOut,

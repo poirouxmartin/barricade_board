@@ -6,6 +6,7 @@
 #include "ai.h"
 #include "board.h"
 #include "game.h"
+#include "nn.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <string>
@@ -46,7 +48,10 @@ private:
         want.samples = 512;
         want.callback = nullptr;
         dev_ = SDL_OpenAudioDevice(nullptr, 0, &want, &got_, SDL_AUDIO_ALLOW_ANY_CHANGE);
-        if (dev_ == 0) return false;
+        if (dev_ == 0) {
+            SDL_Log("SDL audio device unavailable: %s", SDL_GetError());
+            return false;
+        }
         SDL_PauseAudioDevice(dev_, 0);
         move_ = synth(880.0, 0.06, false);
         capture_ = synth(280.0, 0.18, true);
@@ -55,27 +60,58 @@ private:
     }
 
     // Render a decaying sine into the device's actual format; `descend` drops
-    // the pitch over the clip for a heavier "thud".
+    // the pitch over the clip for a heavier "thud". Every common SDL format is
+    // handled (F32/F64/S32/S16/U8) because the driver may return any of them
+    // under SDL_AUDIO_ALLOW_ANY_CHANGE.
     std::vector<Uint8> synth(double freq, double dur, bool descend) const {
         const int n = static_cast<int>(got_.freq * dur);
+        const double amp = 0.8;
         std::vector<float> s(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
             const double t = static_cast<double>(i) / got_.freq;
             const double f = descend ? freq * (1.0 - 0.45 * t / dur) : freq;
             const double env = std::min(1.0, std::min(t / 0.008, (dur - t) / 0.04));
             s[static_cast<size_t>(i)] =
-                static_cast<float>(0.55 * env * std::sin(2.0 * 3.14159265358979 * f * t));
+                static_cast<float>(amp * env * std::sin(2.0 * 3.14159265358979 * f * t));
         }
-        std::vector<Uint8> out;
-        out.reserve(static_cast<size_t>(n) * (SDL_AUDIO_BITSIZE(got_.format) / 8));
+
+        const int bits = SDL_AUDIO_BITSIZE(got_.format);
         const bool isBig = SDL_AUDIO_ISBIGENDIAN(got_.format);
-        if (got_.format == AUDIO_F32SYS) {
+        std::vector<Uint8> out;
+        out.reserve(static_cast<size_t>(n) * (bits / 8));
+        if (SDL_AUDIO_ISFLOAT(got_.format)) {
+            if (bits == 64) {
+                for (float v : s) {
+                    const double d = static_cast<double>(v);
+                    Uint8 b[8];
+                    std::memcpy(b, &d, 8);
+                    out.insert(out.end(), b, b + 8);
+                }
+            } else {
+                for (float v : s) {
+                    Uint8 b[4];
+                    std::memcpy(b, &v, 4);
+                    out.insert(out.end(), b, b + 4);
+                }
+            }
+        } else if (bits == 32) {
             for (float v : s) {
+                const Sint32 x = static_cast<Sint32>(v * 2147483647.0);
                 Uint8 b[4];
-                std::memcpy(b, &v, 4);
+                if (isBig) {
+                    b[0] = static_cast<Uint8>(x >> 24);
+                    b[1] = static_cast<Uint8>(x >> 16);
+                    b[2] = static_cast<Uint8>(x >> 8);
+                    b[3] = static_cast<Uint8>(x & 0xFF);
+                } else {
+                    b[0] = static_cast<Uint8>(x & 0xFF);
+                    b[1] = static_cast<Uint8>(x >> 8);
+                    b[2] = static_cast<Uint8>(x >> 16);
+                    b[3] = static_cast<Uint8>(x >> 24);
+                }
                 out.insert(out.end(), b, b + 4);
             }
-        } else if (SDL_AUDIO_ISSIGNED(got_.format)) {
+        } else if (bits == 16) {
             for (float v : s) {
                 const Sint16 x = static_cast<Sint16>(v * 32767.0);
                 Uint8 b[2];
@@ -89,6 +125,7 @@ private:
                 out.insert(out.end(), b, b + 2);
             }
         } else {
+            // 8-bit unsigned PCM, the only common 8-bit device format
             for (float v : s) {
                 out.push_back(static_cast<Uint8>(v * 127.0 + 128.0));
             }
@@ -468,6 +505,7 @@ struct AdviceView {
     std::vector<barricade::BarricadeRecommendation> placements;  // auto mode
     std::vector<ScenarioView> scenarios;                 // engine mode
     std::vector<double> rootShares;                       // sim shares of the current position
+    std::vector<double> bestShares;   // auto mode: sim shares after the best move
     double bestGain = -1.0;  // current player's win% of the best move (-1 unknown)
     long long bestSims = 0;  // games played for bestGain
     bool engineActive = false;
@@ -827,6 +865,11 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
             }
         }
         if (bestIdx < advice.scenarios.size()) evalShares = &advice.scenarios[bestIdx].shares;
+    } else if (match && !advice.bestShares.empty()) {
+        // Overlay closed: the auto-analysis has simulated the best move, so the
+        // evaluation agrees with the conseils box instead of flipping to the
+        // raw background sim.
+        evalShares = &advice.bestShares;
     }
     const bool adviceEval = evalShares != &simShares;
 
@@ -1432,14 +1475,27 @@ void drawMenu(SDL_Renderer* r, TTF_Font* titleFont, TTF_Font* font, SDL_Texture*
 
 int main(int argc, char* argv[]) {
     int playerCount = 4;
-    if (argc > 1) {
-        playerCount = std::atoi(argv[1]);
-        if (playerCount < 2 || playerCount > 4) playerCount = 4;
-    }
     int humanCount = 1;
-    if (argc > 2) {
-        humanCount = std::atoi(argv[2]);
-        if (humanCount < 0 || humanCount > playerCount) humanCount = 1;
+    std::string positionFile;
+    if (argc > 1) {
+        const std::string a1 = argv[1];
+        const bool isPosFile = a1.size() > 4 && a1.compare(a1.size() - 4, 4, ".pos") == 0;
+        if (isPosFile) {
+            // Loading a position: argv[2] may still select the number of human
+            // players; the player count comes from the file itself.
+            positionFile = a1;
+            if (argc > 2) {
+                humanCount = std::atoi(argv[2]);
+                if (humanCount < 0 || humanCount > 4) humanCount = 1;
+            }
+        } else {
+            playerCount = std::atoi(argv[1]);
+            if (playerCount < 2 || playerCount > 4) playerCount = 4;
+            if (argc > 2) {
+                humanCount = std::atoi(argv[2]);
+                if (humanCount < 0 || humanCount > playerCount) humanCount = 1;
+            }
+        }
     }
     const auto isAi = [&humanCount](int p) { return p >= humanCount; };
     constexpr int kAiBudget = 1000;           // ms of MCTS search per AI move
@@ -1488,7 +1544,35 @@ int main(int argc, char* argv[]) {
     if (!titleFont) titleFont = font;
 
     barricade::Game game(playerCount);
-    game.startTurn();
+    if (!positionFile.empty()) {
+        std::ifstream f(positionFile);
+        if (!f) {
+            SDL_Log("cannot open position file: %s", positionFile.c_str());
+            TTF_Quit();
+            SDL_Quit();
+            return EXIT_FAILURE;
+        }
+        std::string line;
+        std::getline(f, line);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!game.loadPosition(line)) {
+            SDL_Log("loadPosition failed: %s", positionFile.c_str());
+            TTF_Quit();
+            SDL_Quit();
+            return EXIT_FAILURE;
+        }
+    } else {
+        game.startTurn();
+    }
+
+    // Neural MCTS: when a trained weights.bin sits next to the executable the
+    // search switches to PUCT priors + neural leaf values; otherwise it uses
+    // the rollout-based heuristics exactly as before.
+    barricade::nn::NeuralNet nnNet;
+    if (nnNet.load("weights.bin")) {
+        barricade::setMctsNetwork(&nnNet);
+        SDL_Log("weights.bin loaded: neural MCTS active");
+    }
 
     SoundManager sound;
 
@@ -1532,6 +1616,7 @@ int main(int argc, char* argv[]) {
     std::thread adviceThread;
     std::vector<barricade::MctsRecommendation> adviceResult;
     std::vector<barricade::BarricadeRecommendation> advicePlaceResult;
+    std::vector<double> adviceBestShares;  // sim shares after the best auto move
     int adviceMode = 0;  // mode of the in-flight computation
     uint64_t adviceSig = 0;
 
@@ -1573,17 +1658,39 @@ int main(int argc, char* argv[]) {
         adviceSig = posSig(game);
         advice.moves.clear();
         advice.placements.clear();
+        advice.bestShares.clear();
         const barricade::Game snapshot = game;
         adviceBusy = true;
         adviceHaveResult = false;
         adviceThread = std::thread([snapshot, mode, &adviceResult, &advicePlaceResult,
-                                    &adviceHaveResult] {
+                                    &adviceBestShares, &adviceHaveResult] {
+            std::vector<double> best;
             if (mode == 2) {
                 advicePlaceResult = barricade::barricadeRecommendations(snapshot, 6);
+                if (!advicePlaceResult.empty()) {
+                    barricade::Game child = snapshot;
+                    if (child.placeBarricadeFast(advicePlaceResult[0].cell)) {
+                        best = barricade::simulateWinChances(child, 3000);
+                    }
+                }
             } else {
                 adviceResult =
                     barricade::mctsRecommendations(snapshot, snapshot.currentPlayer(), kAiBudget);
+                for (const auto& rec : adviceResult) {
+                    if (rec.move.pawn < 0) continue;
+                    barricade::Game child = snapshot;
+                    if (!child.movePawn(snapshot.currentPlayer(), rec.move.pawn, rec.move.dest)) {
+                        continue;
+                    }
+                    if (child.pendingBarricade()) {
+                        const auto dist = barricade::dynamicGoalDist(snapshot);
+                        child.placeBarricadeFast(barricade::cheapBarricadePlacement(child, dist));
+                    }
+                    best = barricade::simulateWinChances(child, 3000);
+                    break;
+                }
             }
+            adviceBestShares = std::move(best);
             adviceHaveResult = true;
         });
     };
@@ -1592,6 +1699,7 @@ int main(int argc, char* argv[]) {
         advice.moves.clear();
         advice.placements.clear();
         advice.scenarios.clear();
+        advice.bestShares.clear();
         engineStop();
     };
     const auto toggleAdvice = [&] {
@@ -1743,6 +1851,15 @@ int main(int argc, char* argv[]) {
                 } else if (e.key.keysym.sym == SDLK_m) {
                     state = AppState::Menu;
                     closeAdvice();
+                } else if (e.key.keysym.sym == SDLK_e) {
+                    const std::string pos = game.savePosition();
+                    std::ofstream out("position.pos");
+                    if (out) {
+                        out << pos << "\n";
+                        setMessage(msg, "Position exportee -> position.pos");
+                    } else {
+                        setMessage(msg, "Export impossible (position.pos)");
+                    }
                 }
             } else if (e.type == SDL_MOUSEBUTTONDOWN) {
                 const int mx = e.button.x, my = e.button.y;
@@ -1943,6 +2060,7 @@ if (game.isOver()) {
                 } else {
                     advice.moves = std::move(adviceResult);
                 }
+                advice.bestShares = std::move(adviceBestShares);
                 advice.busy = false;
             }
 

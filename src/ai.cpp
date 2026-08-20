@@ -1,5 +1,7 @@
 #include "ai.h"
 
+#include "nn.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -16,6 +18,19 @@
 namespace barricade {
 
 namespace {
+
+// Neural network driving the MCTS when installed (see setMctsNetwork). While
+// null the search falls back to the rollout-based selection below.
+const nn::NeuralNet* g_nn = nullptr;
+
+// Leaf value from the network: the root player's win probability mapped to
+// [-1, 1] so it mixes with the rollout/score accumulation unchanged.
+// A finished game returns the exact result, skipping an expensive forward.
+double nnLeafValue(const Game& g, int rootPlayer, const nn::NeuralNet* net) {
+    if (g.isOver()) return g.winner() == rootPlayer ? 1.0 : -1.0;
+    const nn::NetOut out = net->evaluate(g);
+    return 2.0 * out.value[rootPlayer] - 1.0;
+}
 
 constexpr int kInf = 1000000;
 constexpr double kUctC = 1.414;
@@ -582,6 +597,7 @@ struct TreeNode {
     bool expanded = false;
     size_t nextAction = 0;
     std::vector<AIMove> actions;
+    std::vector<double> priors;  // PUCT priors, parallel to `actions` (NN mode)
     TreeLink* children = nullptr;
 };
 
@@ -589,6 +605,7 @@ struct TreeLink {
     AIMove action;
     TreeNode* node;
     TreeLink* next;
+    double prior = 0.0;
 };
 
 // Nodes/links a worker allocated; kept alive until the worker is joined.
@@ -659,6 +676,7 @@ struct Worker {
 
 std::atomic<long long> g_nodeCount{0};
 std::atomic<long long> g_iterations{0};
+std::atomic<long long> g_rollouts{0};
 std::atomic<long long> g_elapsedUs{0};
 std::atomic<double> g_avgDepth{0.0};
 std::atomic<double> g_winProb{0.0};
@@ -667,7 +685,7 @@ std::atomic<double> g_winProb{0.0};
 // A node with a pending barricade is a placement node: its actions are the
 // best candidate cells for the captured barricade (pawn == -1 marks a
 // placement). Otherwise the actions are the pawn moves.
-void expandNode(TreeNode* n, const std::vector<int>& dist) {
+void expandNode(TreeNode* n, const std::vector<int>& dist, const nn::NeuralNet* net) {
     if (n->game.pendingBarricade()) {
         for (const Point& c : cheapBarricadeCandidates(n->game, kBarricadeBranch, dist)) {
             n->actions.push_back({-1, c});
@@ -704,6 +722,41 @@ void expandNode(TreeNode* n, const std::vector<int>& dist) {
         }
     }
     if (n->actions.empty()) n->actions.push_back(AIMove{});  // skip pseudo-action
+
+    // Neural priors: softmax of the network's policy logits over the actions
+    // kept by the pruning above (captures and wins are kept, so the network is
+    // trained on exactly the same action set the search explores).
+    n->priors.clear();
+    if (net) {
+        const nn::NetOut out = net->evaluate(n->game);
+        n->priors.resize(n->actions.size(), 0.0);
+        std::vector<double> lg(n->actions.size(), -1e30);
+        bool any = false;
+        for (size_t i = 0; i < n->actions.size(); ++i) {
+            const AIMove& mv = n->actions[i];
+            int slot = -1;
+            if (mv.pawn >= 0 && mv.dest.x >= 0) {
+                slot = mv.pawn;
+            } else if (mv.dest.x >= 0) {
+                slot = nn::kPolicySlots - 1;  // placement
+            }
+            if (slot < 0) continue;  // skip pseudo-action has no logit
+            lg[i] = out.policy[slot * nn::kHW + mv.dest.y * nn::kColsN + mv.dest.x];
+            any = true;
+        }
+        if (any) {
+            double mx = lg[0];
+            for (double v : lg) mx = std::max(mx, v);
+            double z = 0.0;
+            for (double v : lg) {
+                if (v > -1e20) z += std::exp(v - mx);
+            }
+            for (size_t i = 0; i < lg.size(); ++i) {
+                if (lg[i] <= -1e20) continue;
+                n->priors[i] = std::exp(lg[i] - mx) / z;
+            }
+        }
+    }
     n->expanded = true;
 }
 
@@ -726,12 +779,32 @@ TreeNode* createChild(TreeNode* n, const AIMove& mv, std::mt19937& rng, Worker& 
     return child;
 }
 
-void publish(TreeNode* n, TreeNode* child, const AIMove& mv, Worker& w) {
+void publish(TreeNode* n, TreeNode* child, const AIMove& mv, double prior, Worker& w) {
     TreeLink* link = w.allocLink(mv, child, n->children);
+    link->prior = prior;
     n->children = link;
 }
 
 TreeNode* uctSelect(TreeNode* n) {
+    if (!n->priors.empty()) {
+        // PUCT with neural priors: U = Q + c * P * sqrt(N_parent) / (1 + N_child).
+        const double nv = std::max(1.0, static_cast<double>(n->visits));
+        constexpr double cPuct = 1.5;
+        TreeNode* best = nullptr;
+        double bestUct = -1e300;
+        for (TreeLink* l = n->children; l; l = l->next) {
+            TreeNode* c = l->node;
+            if (!c) continue;
+            const double cv = static_cast<double>(c->visits);
+            const double q = cv > 0.0 ? c->score / cv : 0.0;
+            const double uct = q + cPuct * l->prior * std::sqrt(nv) / (1.0 + cv);
+            if (uct > bestUct) {
+                bestUct = uct;
+                best = c;
+            }
+        }
+        return best;
+    }
     const long long nv = n->visits;
     const double base = kUctC * std::sqrt(std::log(static_cast<double>(nv) + 1.0));
     TreeNode* best = nullptr;
@@ -753,7 +826,7 @@ TreeNode* uctSelect(TreeNode* n) {
 // One worker's search on its private tree, until the shared deadline.
 void treeSearch(TreeNode* root, int player,
                 std::chrono::steady_clock::time_point start, int budgetMs, Worker& w,
-                const std::vector<int>& dist) {
+                const std::vector<int>& dist, const nn::NeuralNet* net) {
     std::mt19937 rng(std::random_device{}());
     const auto deadline = start + std::chrono::milliseconds(budgetMs);
     std::vector<TreeNode*> path;
@@ -769,7 +842,7 @@ void treeSearch(TreeNode* root, int player,
             n = c;
             path.push_back(n);
         }
-        if (!n->expanded) expandNode(n, dist);
+        if (!n->expanded) expandNode(n, dist, net);
 
         double v;
         if (n->nextAction < n->actions.size()) {
@@ -779,8 +852,16 @@ void treeSearch(TreeNode* root, int player,
                 ++iter;
                 continue;
             }
-            publish(n, child, n->actions[idx], w);
-            v = rollout(child->game, player, rng, dist);
+            const double prior = n->priors.empty() ? 0.0 : n->priors[idx];
+            publish(n, child, n->actions[idx], prior, w);
+            if (child->game.isOver()) {
+                v = child->game.winner() == player ? 1.0 : -1.0;
+            } else if (net) {
+                v = nnLeafValue(child->game, player, net);
+            } else {
+                ++g_rollouts;
+                v = rollout(child->game, player, rng, dist);
+            }
             child->visits = 1;
             child->score = v;
             for (TreeNode* p : path) {
@@ -789,7 +870,7 @@ void treeSearch(TreeNode* root, int player,
             }
             w.depthSum += path.size() + 1;  // depth of the new leaf
         } else {
-            v = heuristicEval(n->game, player, dist);
+            v = net ? nnLeafValue(n->game, player, net) : heuristicEval(n->game, player, dist);
             for (TreeNode* p : path) {
                 p->visits++;
                 p->score += v;
@@ -864,6 +945,9 @@ AIMove pickBest(const std::vector<ActionStats>& stats, const Game& game, int pla
 
 }  // namespace
 
+void setMctsNetwork(const nn::NeuralNet* net) { g_nn = net; }
+const nn::NeuralNet* mctsNetwork() { return g_nn; }
+
 // Root-parallel MCTS: every worker searches its own tree from the same root
 // position; the root children statistics are summed across workers.
 std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budgetMs,
@@ -890,13 +974,13 @@ std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budge
     }
 
     if (nThreads == 1) {
-        treeSearch(roots[0], player, start, budgetMs, *workers[0], dist);
+        treeSearch(roots[0], player, start, budgetMs, *workers[0], dist, g_nn);
     } else {
         std::vector<std::thread> threads;
         threads.reserve(nThreads);
         for (int t = 0; t < nThreads; ++t) {
             threads.emplace_back(
-                [&, t] { treeSearch(roots[t], player, start, budgetMs, *workers[t], dist); });
+                [&, t] { treeSearch(roots[t], player, start, budgetMs, *workers[t], dist, g_nn); });
         }
         for (std::thread& th : threads) th.join();
     }
@@ -965,6 +1049,7 @@ AIMove mctsMove(const Game& game, int player, int budgetMs) {
 // `mctsActionStats` call.
 long long mctsIterationCount() { return g_iterations.load(std::memory_order_relaxed); }
 long long mctsNodeCount() { return g_nodeCount.load(std::memory_order_relaxed); }
+long long mctsRolloutCount() { return g_rollouts.load(std::memory_order_relaxed); }
 
 SearchInfo mctsInfo() {
     return {g_iterations.load(std::memory_order_relaxed),

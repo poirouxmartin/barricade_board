@@ -8,6 +8,16 @@
 
 namespace barricade {
 
+namespace nn {
+class NeuralNet;
+}  // namespace nn
+
+// Installs a policy/value network for the MCTS search (PUCT priors and neural
+// leaf values). Pass nullptr to revert to the rollout-based search. The
+// heuristics (winChances, simulateWinChances, placement scores) are untouched.
+void setMctsNetwork(const nn::NeuralNet* net);
+const nn::NeuralNet* mctsNetwork();
+
 struct AIMove {
     int pawn = -1;
     Point dest{-1, -1};
@@ -43,6 +53,7 @@ std::vector<ActionStats> mctsActionStats(const Game& game, int player, int budge
 // Diagnostics from the last MCTS search: number of iterations and tree nodes.
 long long mctsIterationCount();
 long long mctsNodeCount();
+long long mctsRolloutCount();  // rollouts performed in the last search (0 in NN mode)
 
 // Diagnostics of the last completed MCTS search (AI move or advice request).
 struct SearchInfo {

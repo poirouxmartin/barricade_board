@@ -1,5 +1,6 @@
 #include "ai.h"
 #include "game.h"
+#include "nn.h"
 
 #include <atomic>
 #include <chrono>
@@ -454,7 +455,154 @@ check(g.placeBarricade(cells[0]), "barricade placed");
               "deadlock resolution picks a real player");
     }
 
-    if (failures == 0) {
+// Position notation: round-trip a fresh game (identical re-save).
+    {
+        Game g(4);
+        g.startTurn();
+        g.forceDice(3);
+        const std::string s = g.savePosition();
+        Game g2(4);
+        check(g2.loadPosition(s), "load fresh position");
+        check(g2.playerCount() == 4 && g2.currentPlayer() == g.currentPlayer(),
+              "fresh round-trip keeps player/turn");
+        check(g2.dice() == g.dice(), "fresh round-trip keeps dice");
+        check(g2.savePosition() == s, "fresh position re-saves identically");
+    }
+
+    // Mid-game: pawns out and a captured barricade in hand.
+    {
+        Game g(2);
+        g.forceDice(1); g.movePawnFast(0, 0, {2, 13});  // red leaves the base
+        g.forceDice(1); g.movePawnFast(1, 0, {6, 13});  // green leaves the base
+        g.forceDice(4); g.movePawnFast(0, 0, {4, 11});  // red captures (4,11)
+        check(g.pendingBarricade(), "setup: barricade in hand");
+        const std::string s = g.savePosition();
+        Game g2(2);
+        check(g2.loadPosition(s), "load mid-game position");
+        check(g2.pendingBarricade(), "mid-game keeps barricade in hand");
+        check(g2.currentPlayer() == 0 && g2.dice() == 4, "mid-game keeps turn/dice");
+        check(g2.pawnPos(0, 0) == Point{4, 11}, "mid-game keeps capturing pawn");
+        check(!g2.barricadeAt({4, 11}), "captured barricade cell stays empty");
+        check(g2.savePosition() == s, "mid-game position re-saves identically");
+    }
+
+    // Finished game: goal reached, winner recorded.
+    {
+        const std::string s =
+            "barricade;N=2;turn=0;dice=3;hand=0;over=1;winner=0;"
+            "P0=8,0|-|-|-|-;P1=6,13|-|-|-|-;"
+            "bars=8,1|8,3|8,4|8,5|6,7|10,7|0,11|4,11|8,11|12,11|16,11;act=41";
+        Game g(2);
+        check(g.loadPosition(s), "load finished position");
+        check(g.isOver() && g.winner() == 0, "finished position keeps winner");
+        check(g.savePosition() == s, "finished position re-saves identically");
+    }
+
+    // Malformed positions are rejected without corrupting the game.
+    {
+        Game g(2);
+        const std::string all = "8,1|8,3|8,4|8,5|6,7|10,7|0,11|4,11|8,11|12,11|16,11";
+        check(!g.loadPosition("garbage"), "reject bad header");
+        check(!g.loadPosition("barricade;N=2;turn=0;dice=7;hand=0;over=0;winner=-1;"
+                              "P0=-|-|-|-|-;P1=-|-|-|-|-;bars=" + all + ";act=0"),
+              "reject bad dice");
+        check(!g.loadPosition("barricade;N=2;turn=0;dice=3;hand=0;over=0;winner=-1;"
+                              "P0=-|-|-|-|-;P1=-|-|-|-|-;bars=8,1|8,3|8,4|8,5|6,7|10,7|"
+                              "0,11|4,11|8,11|12,11;act=0"),
+              "reject wrong barricade count");
+        check(!g.loadPosition("barricade;N=2;turn=0;dice=3;hand=0;over=0;winner=-1;"
+                              "P0=8,1|-|-|-|-;P1=-|-|-|-|-;bars=" + all + ";act=0"),
+              "reject pawn standing on a barricade");
+        check(!g.loadPosition("barricade;N=2;turn=0;dice=3;hand=0;over=0;winner=-1;"
+                              "P0=6,13|-|-|-|-;P1=6,13|-|-|-|-;bars=" + all + ";act=0"),
+              "reject two pawns on the same cell");
+        check(g.playerCount() == 2 && !g.isOver(), "failed loads leave a valid reset game");
+    }
+
+    // Neural network: forward determinism, sane zero-net output and featurize.
+    {
+        nn::NeuralNet net;
+        Game g(2);
+        g.startTurn();
+        g.forceDice(3);
+        const nn::NetOut a = net.evaluate(g);
+        const nn::NetOut b = net.evaluate(g);
+        check(a.value[0] > 0.1f && a.value[0] < 0.4f, "zero net value near uniform");
+        check(a.value[0] == b.value[0] && a.policy[0] == b.policy[0],
+              "forward is deterministic");
+        float vs = 0.0f;
+        for (int k = 0; k < kMaxPlayers; ++k) vs += a.value[k];
+        check(vs > 0.99f && vs < 1.01f, "value head sums to one");
+        std::vector<float> pl(static_cast<size_t>(nn::kPlanes) * nn::kHW);
+        nn::featurize(g, pl.data());
+        float sum = 0.0f;
+        for (float v : pl) sum += v;
+        check(sum > 0.0f, "featurize produces a non-empty input");
+        check(pl[5 * nn::kHW + 0 * nn::kColsN + 8] == 1.0f, "goal plane set");
+        check(pl[11 * nn::kHW] == g.dice() / 6.0f, "dice plane set");
+        check(pl[7 * nn::kHW + 0] == 1.0f && pl[8 * nn::kHW + 0] == 0.0f,
+              "current-player plane set");
+    }
+
+    // Neural network: save/load round-trips the parameters.
+    {
+        nn::NeuralNet a, b;
+        a.initRandom(42);
+        const std::string tmp = "nn_rt_test.bin";
+        check(a.save(tmp), "nn save");
+        check(b.load(tmp), "nn load");
+        bool same = true;
+        const float* pa = a.params();
+        const float* pb = b.params();
+        for (size_t i = 0; i < a.paramCount(); ++i) {
+            if (pa[i] != pb[i]) {
+                same = false;
+                break;
+            }
+        }
+        check(same, "nn params round-trip");
+        std::remove(tmp.c_str());
+    }
+
+    // MCTS runs with a (random) network installed; without a network the
+    // rollout path is untouched (all the tests above already ran it).
+    {
+        nn::NeuralNet net;
+        net.initRandom(1);
+        setMctsNetwork(&net);
+        Game g(2);
+        g.startTurn();
+        g.forceDice(3);
+        const auto stats = mctsActionStats(g, 0, 100);
+        setMctsNetwork(nullptr);
+        check(!stats.empty(), "neural MCTS returns actions");
+        bool anyVisits = false;
+        for (const ActionStats& s : stats) {
+            if (s.visits > 0) anyVisits = true;
+        }
+        check(anyVisits, "neural MCTS actions have visits");
+    }
+
+    // Training step: finite loss and a changed weight vector.
+    {
+        nn::NeuralNet net;
+        net.initRandom(2);
+        net.setLearningRate(0.1f);
+        std::vector<float> pl(static_cast<size_t>(nn::kPlanes) * nn::kHW, 0.0f);
+        std::vector<float> pol(nn::kPolicySize, 0.0f);
+        pol[nn::policyIndex(0, Point{2, 13})] = 1.0f;
+        const float* planes[1] = {pl.data()};
+        const float* pols[1] = {pol.data()};
+        int wins[1] = {0};
+        const float loss = net.trainBatch(planes, pols, wins, 1);
+        check(loss == loss && loss < 10.0f, "trainBatch finite loss");
+        float diff = 0.0f;
+        const float* p = net.params();
+        for (size_t i = 0; i < net.paramCount(); ++i) diff += p[i] * p[i];
+        check(diff > 0.0f, "trainBatch leaves non-zero params");
+    }
+
+if (failures == 0) {
         std::printf("All smoke tests passed.\n");
         return 0;
     }
