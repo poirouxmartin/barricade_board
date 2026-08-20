@@ -9,6 +9,7 @@
 #include <memory>
 #include <random>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace barricade {
@@ -27,6 +28,12 @@ constexpr int kMaxIterations = 2000000;
 // never missed (the old 24-cell prefix of the ranking only saw cells near the
 // goal, which made every bot dump its barricade at the top and block itself).
 constexpr int kBarricadeBranch = 8;
+// How many non-capturing pawn moves a node keeps per pawn, ranked by the
+// pawn's distance to its goal at the destination. Captures and winning moves
+// are always kept. Pruning the clearly-wasteful moves shrinks the root from
+// ~35 actions to ~10, so each action gets several times more rollouts and the
+// MCTS selection is much sharper.
+constexpr int kKeepMovesPerPawn = 2;
 }  // namespace
 
 // Defined below (with the placement scoring); the search and the win-chance
@@ -566,7 +573,29 @@ void expandNode(TreeNode* n, const std::vector<int>& dist) {
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
             std::memset(seen, 0, sizeof seen);
             const int cnt = n->game.legalDestinationsTo(n->player, m, dests, 512, seen);
-            for (int i = 0; i < cnt; ++i) n->actions.push_back({m, dests[i]});
+            if (cnt == 0) continue;
+            // Captures and wins are always worth exploring. The other moves are
+            // ranked by the distance to the goal at their destination and only
+            // the best few are kept, so a wasted side step cannot eat rollouts
+            // that should go to the plausible moves.
+            std::vector<Point> kept;
+            kept.reserve(cnt);
+            std::vector<std::pair<int, Point>> ordinary;
+            ordinary.reserve(cnt);
+            for (int i = 0; i < cnt; ++i) {
+                if (isGoalCell(dests[i].x, dests[i].y) || n->game.barricadeAt(dests[i])) {
+                    kept.push_back(dests[i]);
+                } else {
+                    ordinary.push_back({distAt(dist, dests[i]), dests[i]});
+                }
+            }
+            std::stable_sort(ordinary.begin(), ordinary.end(),
+                             [](const std::pair<int, Point>& a, const std::pair<int, Point>& b) {
+                                 return a.first < b.first;
+                             });
+            const size_t take = std::min(ordinary.size(), static_cast<size_t>(kKeepMovesPerPawn));
+            for (size_t i = 0; i < take; ++i) kept.push_back(ordinary[i].second);
+            for (const Point& d : kept) n->actions.push_back({m, d});
         }
     }
     if (n->actions.empty()) n->actions.push_back(AIMove{});  // skip pseudo-action
