@@ -993,19 +993,22 @@ std::vector<int> playerArmyDistances(const Game& game, int player) {
     return out;
 }
 
-// Estimated win probabilities per player from the whole army. The per-pawn
-// weight is 1/(turns+2) where `turns` is the expected number of turns left
-// (exact-dice), so advancing and having more pawns out of the base improves
-// the estimate, and near-goal positions are judged by the turns they still
-// need, not by the cells left. Normalized so the shares sum to 1. A player
-// whose closest pawn is within ~3 turns while everyone else is 8+ turns
-// behind is resolved as a sure win, since the curve alone would only read
-// ~40% for it.
+// Estimated win probabilities per player. The game is a first-pawn-to-goal
+// race, so each player is scored by its closest pawn's expected turns
+// (exact-dice, barricade-aware), and the share is that pawn's race rate
+// (1/turns) normalized over the players. Scoring the whole army diluted the
+// leader and flattened the far position space: with 1/(turns+2) summed over
+// four pawns, a player 24 steps ahead of another still read ~25% vs ~25%.
+// A player whose closest pawn is within ~3 turns gets a graded bonus toward
+// 0.95 scaled by the actual gap (turns to the runner-up): the inverse-rate
+// curve alone reads only ~0.6 for a gate position, while the end-game
+// simulation says ~0.9+. Normalized so the shares sum to 1.
 std::vector<double> winChances(const Game& game) {
     const auto dist = buildGoalDistDynamic(currentBarricades(game));
+    const int n = game.playerCount();
     double bestE[kMaxPlayers];
     int leader = 0;
-    for (int p = 0; p < game.playerCount(); ++p) {
+    for (int p = 0; p < n; ++p) {
         double b = 1e9;
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
             b = std::min(b, pawnExpectedTurns(game, p, m, dist));
@@ -1013,33 +1016,37 @@ std::vector<double> winChances(const Game& game) {
         bestE[p] = b;
         if (b < bestE[leader]) leader = p;
     }
-    double secondE = 1e9;
-    for (int p = 0; p < game.playerCount(); ++p) {
-        if (p != leader) secondE = std::min(secondE, bestE[p]);
-    }
-    if (bestE[leader] <= 3.0 && secondE - bestE[leader] >= 8.0) {
-        std::vector<double> out(game.playerCount(), 0.0);
-        out[leader] = 0.95;  // big bonus for the near-win, not a sure 100%
-        const double rest = 0.05 / (game.playerCount() - 1);
-        for (int p = 0; p < game.playerCount(); ++p) {
-            if (p != leader) out[p] = rest;
-        }
+    std::vector<double> out(n, 0.0);
+    if (bestE[leader] <= 0.0) {
+        // A pawn is already on the goal: the game is over.
+        out[leader] = 1.0;
         return out;
     }
-
-    std::vector<double> out(game.playerCount());
-    for (int p = 0; p < game.playerCount(); ++p) {
-        double s = 0.0;
-        for (int m = 0; m < kPawnsPerPlayer; ++m) {
-            double t = pawnExpectedTurns(game, p, m, dist);
-            if (t > 24.0) t = 24.0;
-            s += 1.0 / (t + 2.0);
-        }
-        out[p] = s;
+    double rate[kMaxPlayers], rateSum = 0.0;
+    for (int p = 0; p < n; ++p) {
+        rate[p] = 1.0 / (bestE[p] + 1.0);
+        rateSum += rate[p];
     }
-    double sum = 0.0;
-    for (double v : out) sum += v;
-    for (double& v : out) v /= sum;
+    for (int p = 0; p < n; ++p) out[p] = rate[p] / rateSum;
+    if (bestE[leader] <= 3.0) {
+        double secondE = 1e9;
+        for (int p = 0; p < n; ++p) {
+            if (p != leader) secondE = std::min(secondE, bestE[p]);
+        }
+        const double gap = std::max(0.0, secondE - bestE[leader]);
+        const double boost = std::min(1.0, gap / 4.0);
+        const double leaderShare = out[leader] + boost * (0.95 - out[leader]);
+        const double otherRate = rateSum - rate[leader];
+        if (otherRate <= 0.0) {
+            out[leader] = 1.0;
+        } else {
+            const double rest = 1.0 - leaderShare;
+            for (int p = 0; p < n; ++p) {
+                if (p != leader) out[p] = rest * rate[p] / otherRate;
+            }
+            out[leader] = leaderShare;
+        }
+    }
     return out;
 }
 

@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <random>
 #include <string>
@@ -21,6 +22,86 @@
 #include <vector>
 
 namespace {
+
+// Minimal procedural sound: SDL2 audio with a queue-based device, so no extra
+// dependency is needed. Three short synthesized clips are queued on the
+// matching game events: a move blip, a heavier capture thud, a placement knock.
+class SoundManager {
+public:
+    void playMove() { play(move_); }
+    void playCapture() { play(capture_); }
+    void playPlace() { play(place_); }
+
+private:
+    SDL_AudioDeviceID dev_ = 0;
+    SDL_AudioSpec got_{};
+    std::vector<Uint8> move_, capture_, place_;
+
+    bool init() {
+        if (dev_ != 0) return true;
+        SDL_AudioSpec want{};
+        want.freq = 22050;
+        want.format = AUDIO_F32SYS;
+        want.channels = 1;
+        want.samples = 512;
+        want.callback = nullptr;
+        dev_ = SDL_OpenAudioDevice(nullptr, 0, &want, &got_, SDL_AUDIO_ALLOW_ANY_CHANGE);
+        if (dev_ == 0) return false;
+        SDL_PauseAudioDevice(dev_, 0);
+        move_ = synth(880.0, 0.06, false);
+        capture_ = synth(280.0, 0.18, true);
+        place_ = synth(190.0, 0.09, false);
+        return true;
+    }
+
+    // Render a decaying sine into the device's actual format; `descend` drops
+    // the pitch over the clip for a heavier "thud".
+    std::vector<Uint8> synth(double freq, double dur, bool descend) const {
+        const int n = static_cast<int>(got_.freq * dur);
+        std::vector<float> s(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            const double t = static_cast<double>(i) / got_.freq;
+            const double f = descend ? freq * (1.0 - 0.45 * t / dur) : freq;
+            const double env = std::min(1.0, std::min(t / 0.008, (dur - t) / 0.04));
+            s[static_cast<size_t>(i)] =
+                static_cast<float>(0.55 * env * std::sin(2.0 * 3.14159265358979 * f * t));
+        }
+        std::vector<Uint8> out;
+        out.reserve(static_cast<size_t>(n) * (SDL_AUDIO_BITSIZE(got_.format) / 8));
+        const bool isBig = SDL_AUDIO_ISBIGENDIAN(got_.format);
+        if (got_.format == AUDIO_F32SYS) {
+            for (float v : s) {
+                Uint8 b[4];
+                std::memcpy(b, &v, 4);
+                out.insert(out.end(), b, b + 4);
+            }
+        } else if (SDL_AUDIO_ISSIGNED(got_.format)) {
+            for (float v : s) {
+                const Sint16 x = static_cast<Sint16>(v * 32767.0);
+                Uint8 b[2];
+                if (isBig) {
+                    b[0] = static_cast<Uint8>(x >> 8);
+                    b[1] = static_cast<Uint8>(x & 0xFF);
+                } else {
+                    b[0] = static_cast<Uint8>(x & 0xFF);
+                    b[1] = static_cast<Uint8>(x >> 8);
+                }
+                out.insert(out.end(), b, b + 2);
+            }
+        } else {
+            for (float v : s) {
+                out.push_back(static_cast<Uint8>(v * 127.0 + 128.0));
+            }
+        }
+        return out;
+    }
+
+    void play(const std::vector<Uint8>& buf) {
+        if (buf.empty()) return;
+        if (!init()) return;
+        SDL_QueueAudio(dev_, buf.data(), static_cast<Uint32>(buf.size()));
+    }
+};
 
 constexpr int kCell = 40;
 constexpr int kStatusH = 56;
@@ -386,6 +467,7 @@ struct AdviceView {
     std::vector<barricade::MctsRecommendation> moves;    // auto mode
     std::vector<barricade::BarricadeRecommendation> placements;  // auto mode
     std::vector<ScenarioView> scenarios;                 // engine mode
+    std::vector<double> rootShares;                       // sim shares of the current position
     double bestGain = -1.0;  // current player's win% of the best move (-1 unknown)
     long long bestSims = 0;  // games played for bestGain
     bool engineActive = false;
@@ -402,6 +484,7 @@ struct AnalysisEngine {
     std::mutex m;
     std::condition_variable cv;
     std::vector<ScenarioView> scenarios;   // last completed step (guarded by m)
+    std::vector<double> rootShares;        // sim shares of the unmodified position (guarded by m)
     std::atomic<bool> exit{false};
     std::atomic<bool> want{false};         // work requested
     std::atomic<bool> running{false};      // a session is deepening
@@ -435,6 +518,14 @@ void engineLoop(AnalysisEngine& E) {
             // fixed-size position simulation.
             std::vector<ScenarioView> sc;
             const auto dist = barricade::dynamicGoalDist(snapshot);
+            // Sim shares of the position as it stands: the baseline the
+            // placement gains in the list below are measured against. A wall
+            // the exact BFS scorer rates <= 0 (it underrates the shared goal
+            // funnel, where a block slows the leaders too) can still lift the
+            // simulated share, and the UI should present it as useful.
+            const std::vector<double> rootShares =
+                mode == 2 ? barricade::simulateWinChances(snapshot, 3000)
+                          : std::vector<double>{};
             // Exact BFS placement scores: they account for the damage a wall
             // does to our own pawns, which the greedy sim around the goal gate
             // does not, so placement advice ranks them first.
@@ -526,6 +617,7 @@ void engineLoop(AnalysisEngine& E) {
             {
                 std::lock_guard<std::mutex> guard(E.m);
                 E.scenarios = std::move(sc);
+                E.rootShares = rootShares;
                 E.stepMs.store(budget);
             }
             E.step.fetch_add(1);
@@ -564,14 +656,29 @@ void drawSmallButton(SDL_Renderer* r, TTF_Font* small, int x, int y, int w, int 
     renderCentered(r, small, label, x + w / 2, y + h / 2 + 1, kTextColor);
 }
 
+// A placement is worth showing when the exact BFS scorer rates it useful or
+// the end-game simulation lifts the current player's share over the
+// unmodified position. The exact scorer underrates blocks on the shared goal
+// funnel (they slow the leaders of every player, which the noisy greedy sim
+// picks up), so "no useful block" must not hide placements the sim proves.
+bool placementHelps(const ScenarioView& sv, int cp, const std::vector<double>& rootShares) {
+    if (sv.placementScore > 0) return true;
+    if (sv.shares.size() > static_cast<size_t>(cp) &&
+        rootShares.size() > static_cast<size_t>(cp)) {
+        return sv.shares[cp] > rootShares[cp] + 0.005;
+    }
+    return false;
+}
+
 void drawAdviceOverlay(SDL_Renderer* r, TTF_Font* font, const barricade::Game& game,
                        const AdviceView& advice, bool match) {
     if (!advice.show || advice.busy || !match) return;
     const size_t n = std::min<size_t>(advice.scenarios.size(), 4);
     const bool placementMode = !advice.scenarios.empty() && advice.scenarios[0].isPlacement;
     if (placementMode) {
-        // a wall with no exact value is "no useful block": show nothing
-        if (advice.scenarios[0].placementScore <= 0) return;
+        // a wall with no value is "no useful block": show nothing
+        const int cp = game.currentPlayer();
+        if (!placementHelps(advice.scenarios[0], cp, advice.rootShares)) return;
         // numbered placement badges on the recommended cells
         for (size_t i = 0; i < n; ++i) {
             const auto& sv = advice.scenarios[i];
@@ -702,6 +809,27 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
     const int cw = kPanelW - 2 * kPanelPad;
     const PanelLayout L = panelLayout(advice.show);
 
+    // The headline evaluation and the "sim" bars assume best play whenever the
+    // advice engine has explored the position: they show the simulated shares
+    // of the best recommended action, so the evaluation agrees with the
+    // conseils box (a 90% move reads as a 90% evaluation). Without advice, the
+    // live background simulation of the unmodified position is shown.
+    const std::vector<double>* evalShares = &simShares;
+    if (!advice.scenarios.empty() && !advice.busy) {
+        const int cp = game.currentPlayer();
+        size_t bestIdx = advice.scenarios.size();
+        for (size_t i = 0; i < advice.scenarios.size(); ++i) {
+            const auto& s = advice.scenarios[i].shares;
+            if (s.size() <= static_cast<size_t>(cp)) continue;
+            if (bestIdx == advice.scenarios.size() ||
+                s[cp] > advice.scenarios[bestIdx].shares[cp]) {
+                bestIdx = i;
+            }
+        }
+        if (bestIdx < advice.scenarios.size()) evalShares = &advice.scenarios[bestIdx].shares;
+    }
+    const bool adviceEval = evalShares != &simShares;
+
     // Panel title
     renderText(r, font, "Analyse IA", cx, kStatusH + 12, kTextColor);
     renderText(r, small, "MCTS root-parallel", cx, kStatusH + 32, kTextDim);
@@ -737,9 +865,9 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         row("Profondeur moy.", buf, kTextColor);
         // real end-game estimate (from the position simulation), coherent with
         // the bars below; falls back to the short-horizon MCTS value.
-        if (simGames > 0 && !simShares.empty()) {
+        if (!evalShares->empty()) {
             std::snprintf(buf, sizeof buf, "%d%%",
-                          static_cast<int>(std::lround(simShares[game.currentPlayer()] * 100.0)));
+                          static_cast<int>(std::lround((*evalShares)[game.currentPlayer()] * 100.0)));
         } else {
             std::snprintf(buf, sizeof buf, "%d%%", deepPct(game, info));
         }
@@ -774,8 +902,8 @@ void drawPanel(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, const barricade
         SDL_RenderDrawRect(r, &sbg);
         std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(chances[p] * 100.0)));
         renderText(r, small, buf, statBarX + statBarW + 4, yy, kTextColor);
-        renderText(r, small, "sim", b2.x + 156, yy, kTextDim);
-        const double sim = simShares.empty() ? 0.0 : simShares[p];
+        renderText(r, small, adviceEval ? "rech" : "sim", b2.x + 156, yy, kTextDim);
+        const double sim = evalShares->empty() ? 0.0 : (*evalShares)[p];
         setColor(r, {15, 12, 8, 255});
         const SDL_Rect ibg{simBarX, yb, simBarW, barH};
         SDL_RenderFillRect(r, &ibg);
@@ -906,7 +1034,7 @@ std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)
     if (match && !advice.busy) {
         char line[64];
         if (analysisMode == 2 && !advice.scenarios.empty()) {
-            if (advice.scenarios[0].placementScore > 0) {
+            if (placementHelps(advice.scenarios[0], game.currentPlayer(), advice.rootShares)) {
                 std::snprintf(line, sizeof line, "Bloc -> (%d,%d)",
                               advice.scenarios[0].cell.x, advice.scenarios[0].cell.y);
             } else {
@@ -1010,7 +1138,7 @@ std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(sim * 100.0)
             const auto& sv = advice.scenarios[i];
             char line[64];
             if (sv.isPlacement) {
-                if (sv.placementScore > 0) {
+                if (placementHelps(sv, game.currentPlayer(), advice.rootShares)) {
                     std::snprintf(line, sizeof line, "#%d  Bloc -> (%d,%d)", static_cast<int>(i) + 1,
                                   sv.cell.x, sv.cell.y);
                 } else {
@@ -1322,7 +1450,7 @@ int main(int argc, char* argv[]) {
         std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
     constexpr Uint32 kAiPace = 330;           // min ms between two AI actions
 
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return EXIT_FAILURE;
     }
@@ -1361,6 +1489,8 @@ int main(int argc, char* argv[]) {
 
     barricade::Game game(playerCount);
     game.startTurn();
+
+    SoundManager sound;
 
     enum class AppState { Menu, Playing };
     AppState state = (argc > 1) ? AppState::Playing : AppState::Menu;
@@ -1428,6 +1558,7 @@ int main(int argc, char* argv[]) {
     const auto engineSync = [&] {
         std::lock_guard<std::mutex> guard(engine.m);
         advice.scenarios = engine.scenarios;
+        advice.rootShares = engine.rootShares;
         advice.engineStepMs = engine.stepMs.load();
         advice.engineStep = engine.step.load();
         advice.engineBaseMs = engine.baseMs.load();
@@ -1674,6 +1805,7 @@ int main(int argc, char* argv[]) {
                     const auto cells = game.barricadePlacements();
                     if (std::find(cells.begin(), cells.end(), cell) != cells.end()) {
                         game.placeBarricade(cell);
+                        sound.playPlace();
                         lastMove = cell;
                         lastMoveAt = SDL_GetTicks();
                         selectedPawn = -1;
@@ -1700,6 +1832,11 @@ int main(int argc, char* argv[]) {
                     if (std::find(dests.begin(), dests.end(), cell) != dests.end()) {
                         const barricade::Point from = game.pawnPos(cur, selectedPawn);
                         if (game.movePawn(cur, selectedPawn, cell)) {
+                            if (game.pendingBarricade()) {
+                                sound.playCapture();
+                            } else {
+                                sound.playMove();
+                            }
                             anim = Anim{true, cur, selectedPawn, from, cell, SDL_GetTicks(), 280};
                             lastMove = cell;
                             lastMoveAt = SDL_GetTicks();
@@ -1748,12 +1885,18 @@ if (game.isOver()) {
                 const int cur = game.currentPlayer();
                 if (aiIsPlacement) {
                     game.placeBarricade(aiMove.dest);
+                    sound.playPlace();
                     lastMove = aiMove.dest;
                     lastMoveAt = SDL_GetTicks();
                     msg.clear();
                 } else if (aiMove.pawn >= 0) {
                     const barricade::Point from = game.pawnPos(cur, aiMove.pawn);
                     game.movePawn(cur, aiMove.pawn, aiMove.dest);
+                    if (game.pendingBarricade()) {
+                        sound.playCapture();
+                    } else {
+                        sound.playMove();
+                    }
                     anim = Anim{true, cur, aiMove.pawn, from, aiMove.dest, SDL_GetTicks(), 280};
                     lastMove = aiMove.dest;
                     lastMoveAt = SDL_GetTicks();

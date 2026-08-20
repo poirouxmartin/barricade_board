@@ -60,11 +60,12 @@ std::vector<int> playerProgress(const Game& game);
 // Per-pawn weighted distance to the goal for `player` (kInf if no path).
 std::vector<int> playerArmyDistances(const Game& game, int player);
 
-// Estimated win probabilities per player (normalized so they sum to 1),
-// based on the whole army: the sum of per-pawn weights 1/(turns+2), where
-// `turns` is the expected number of turns left (exact-dice). A player whose
-// closest pawn is within ~3 turns while everyone else is 8+ turns behind gets
-// a large 0.95 share; only an actual win is exactly 1.0. Uses goal distances
+// Estimated win probabilities per player (normalized so they sum to 1).
+// The game is a first-pawn-to-goal race, so each player is scored by its
+// closest pawn's expected turns (exact-dice), and the share is that pawn's
+// race rate (1/turns) normalized over the players. A player whose closest
+// pawn is within ~3 turns gets a graded bonus toward 0.95 scaled by the gap
+// to the runner-up; only an actual win is exactly 1.0. Uses goal distances
 // that account for the barricades currently on the board.
 std::vector<double> winChances(const Game& game);
 
