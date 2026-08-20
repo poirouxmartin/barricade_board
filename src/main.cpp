@@ -438,8 +438,8 @@ void engineLoop(AnalysisEngine& E) {
                     sv.isPlacement = true;
                     sv.value = rec.value;
                     sv.visits = rec.visits;
-                    sv.shares = barricade::simulateWinChances(child, 2000);
-                    sv.sims = 2000;
+                    sv.shares = barricade::simulateWinChances(child, 5000);
+                    sv.sims = 5000;
                     sc.push_back(std::move(sv));
                 } else {
                     if (rec.move.pawn < 0) continue;
@@ -457,8 +457,8 @@ void engineLoop(AnalysisEngine& E) {
                     sv.move = rec.move;
                     sv.value = rec.value;
                     sv.visits = rec.visits;
-                    sv.shares = barricade::simulateWinChances(child, 2000);
-                    sv.sims = 2000;
+                    sv.shares = barricade::simulateWinChances(child, 5000);
+                    sv.sims = 5000;
                     sc.push_back(std::move(sv));
                 }
             }
@@ -484,8 +484,8 @@ void engineLoop(AnalysisEngine& E) {
                     sv.isPlacement = true;
                     sv.value = 0.0;
                     sv.visits = 0;
-                    sv.shares = barricade::simulateWinChances(child, 2000);
-                    sv.sims = 2000;
+                    sv.shares = barricade::simulateWinChances(child, 5000);
+                    sv.sims = 5000;
                     sc.push_back(std::move(sv));
                 }
             }
