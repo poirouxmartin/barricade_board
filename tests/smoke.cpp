@@ -434,6 +434,26 @@ check(g.placeBarricade(cells[0]), "barricade placed");
         }
     }
 
+    // Turn cap: a mutual blockade that never reaches the goal must resolve by
+    // proximity (closest pawn wins) instead of stalling forever.
+    {
+        Game g(2);
+        g.forceDice(1);
+        // Two safe track cells per player, far from the goal and from any
+        // barricade: pawns shuffle back and forth, the goal is never reached.
+        const Point cells[2][2] = {{{6, 5}, {6, 6}}, {{10, 5}, {10, 6}}};
+        int step = 0;
+        while (!g.isOver() && step < barricade::Game::kMaxActions + 50) {
+            const int p = g.currentPlayer();
+            if (!g.movePawnFast(p, 0, cells[p][step % 2])) break;
+            ++step;
+        }
+        check(g.isOver(), "stalled game hits the action cap");
+        check(g.deadlockEnded(), "cap end is flagged as a deadlock");
+        check(g.winner() >= 0 && g.winner() < g.playerCount(),
+              "deadlock resolution picks a real player");
+    }
+
     if (failures == 0) {
         std::printf("All smoke tests passed.\n");
         return 0;

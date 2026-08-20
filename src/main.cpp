@@ -57,6 +57,14 @@ const SDL_Color kPlayerColors[barricade::kMaxPlayers] = {
 const char* kPlayerNames[barricade::kMaxPlayers] = {"Rouge", "Bleu", "Jaune", "Vert"};
 const char* kPlayerShorts[barricade::kMaxPlayers] = {"R", "B", "J", "V"};
 
+std::string winMessage(const barricade::Game& game) {
+    std::string t = "Le joueur ";
+    t += kPlayerNames[game.winner()];
+    t += game.deadlockEnded() ? " gagne par impasse (le plus proche du but)" : " a gagne";
+    t += " ! (R pour rejouer)";
+    return t;
+}
+
 // Distinct colors for the numbered advice arrows (matches the panel legend).
 const SDL_Color kAdvicePalette[8] = {
     {90, 220, 90, 255},    {70, 200, 220, 255}, {235, 160, 60, 255}, {190, 90, 230, 255},
@@ -1180,10 +1188,7 @@ void drawBoard(SDL_Renderer* r, TTF_Font* font, TTF_Font* small, SDL_Texture* wo
 
     if (game.isOver()) {
         const SDL_Color wc = kPlayerColors[game.winner()];
-        std::string t = "Le joueur ";
-        t += kPlayerNames[game.winner()];
-        t += " a gagne ! (R pour rejouer)";
-        renderText(r, font, t, 24, 14, wc);
+        renderText(r, font, winMessage(game), 24, 14, wc);
     } else {
         setColor(r, kPlayerColors[cur]);
         fillCircle(r, 22, kStatusH / 2, 9);
@@ -1458,7 +1463,7 @@ int main(int argc, char* argv[]) {
         for (int p = 0; p < game.playerCount(); ++p) simRun.wins[p].store(0);
         const barricade::Game snapshot = game;
         simRun.stop.store(false);
-        simRun.th = std::thread([snapshot, &simRun] {
+        simRun.th = std::thread([snapshot, &simRun, kSimThreads] {
             barricade::simulateWinChancesAsync(snapshot, 1000000000LL, &simRun.stop,
                                                simRun.wins.data(), snapshot.playerCount(),
                                                &simRun.games, kSimThreads);
@@ -1473,7 +1478,7 @@ int main(int argc, char* argv[]) {
     const auto resumeSim = [&] {
         const barricade::Game snapshot = game;
         simRun.stop.store(false);
-        simRun.th = std::thread([snapshot, &simRun] {
+        simRun.th = std::thread([snapshot, &simRun, kSimThreads] {
             barricade::simulateWinChancesAsync(snapshot, 1000000000LL, &simRun.stop,
                                                simRun.wins.data(), snapshot.playerCount(),
                                                &simRun.games, kSimThreads);
@@ -1672,8 +1677,8 @@ int main(int argc, char* argv[]) {
                             selectedPawn = -1;
                             skipPending = false;
                             closeAdvice();
-                            if (game.isOver()) {
-                                setMessage(msg, std::string("Le joueur ") + kPlayerNames[game.winner()] + " a gagne ! (R pour rejouer)");
+if (game.isOver()) {
+                                setMessage(msg, winMessage(game));
                             } else if (!game.pendingBarricade()) {
                                 msg.clear();
                             }
@@ -1728,7 +1733,7 @@ int main(int argc, char* argv[]) {
                                   kPlayerNames[cur], aiMove.pawn + 1, aiMove.dest.x, aiMove.dest.y);
                     lastAiText = buf;
                     if (game.isOver()) {
-                        setMessage(msg, std::string("Le joueur ") + kPlayerNames[game.winner()] + " a gagne ! (R pour rejouer)");
+                        setMessage(msg, winMessage(game));
                     } else if (!game.pendingBarricade()) {
                         msg.clear();
                     }

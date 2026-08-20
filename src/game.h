@@ -27,6 +27,11 @@ public:
     bool isOver() const { return over_; }
     int winner() const { return winner_; }
     bool pendingBarricade() const { return pending_barricade_; }
+    // Ceiling on the number of actions (moves + placements). A game that hits
+    // it without a goal win is resolved by proximity (the player whose pawn is
+    // closest to the goal wins), so a mutual blockade can never stall forever.
+    static constexpr int kMaxActions = 500;
+    bool deadlockEnded() const { return deadlock_; }
 
     void startTurn();  // rolls the die for the current player
     void nextTurn();   // advances to the next player and rolls
@@ -57,6 +62,8 @@ private:
                  int player, char* seen) const;
     bool ownPawnAt(Point p, int player) const;
     bool applyMove(int player, int pawn, Point dest);
+    void resolveDeadlock();
+    int deadlockWinner() const;
     void setPawn(Point p, int id);  // id player*5+pawn, or 255 = empty
     void setBarricade(Point p);
     void clearBarricade(Point p);
@@ -68,6 +75,8 @@ private:
     int winner_ = -1;
     bool pending_barricade_ = false;
     int captured_barricade_ = -1;
+    int actions_ = 0;
+    bool deadlock_ = false;
 
     std::array<std::array<Point, kPawnsPerPlayer>, kMaxPlayers> pawns_;
     std::array<Point, kBarricadeCount> barricades_;

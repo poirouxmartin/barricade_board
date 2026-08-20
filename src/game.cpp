@@ -37,6 +37,69 @@ const std::array<std::array<Neighbors, kRows>, kCols>& neighbors() {
     return t;
 }
 
+// Distances from the goal cell over the track graph (unweighted BFS), computed
+// once. Used to resolve a turn-capped game by "closest to the goal wins".
+const std::vector<int>& goalProximity() {
+    static const std::vector<int> dist = [] {
+        constexpr int kInf = 1'000'000;
+        std::vector<int> d(kCols * kRows, kInf);
+        std::vector<int> queue;
+        queue.reserve(kCols * kRows);
+        d[0 * kCols + 8] = 0;
+        queue.push_back(0 * kCols + 8);
+        const int dx[4] = {1, -1, 0, 0};
+        const int dy[4] = {0, 0, 1, -1};
+        for (std::size_t head = 0; head < queue.size(); ++head) {
+            const int cur = queue[head];
+            const int cx = cur % kCols;
+            const int cy = cur / kCols;
+            for (int k = 0; k < 4; ++k) {
+                const int nx = cx + dx[k];
+                const int ny = cy + dy[k];
+                if (!isTrackCell(nx, ny)) continue;
+                const int ni = ny * kCols + nx;
+                if (d[cur] + 1 < d[ni]) {
+                    d[ni] = d[cur] + 1;
+                    queue.push_back(ni);
+                }
+            }
+        }
+        return d;
+    }();
+    return dist;
+}
+
+void Game::resolveDeadlock() {
+    over_ = true;
+    deadlock_ = true;
+    winner_ = deadlockWinner();
+}
+
+int Game::deadlockWinner() const {
+    const auto& prox = goalProximity();
+    int bestDist = 1'000'000;
+    int bestSum = 1'000'000;
+    int winner = 0;
+    for (int p = 0; p < player_count_; ++p) {
+        int minDist = 1'000'000;
+        int sum = 0;
+        for (int m = 0; m < kPawnsPerPlayer; ++m) {
+            Point pos = pawnPos(p, m);
+            if (pawnInBase(p, m)) pos = baseFrontCell(p);
+            const int d = prox[pos.y * kCols + pos.x];
+            if (d < minDist) minDist = d;
+            sum += d;
+        }
+        // Closest pawn wins; a tie falls back to the tighter army.
+        if (minDist < bestDist || (minDist == bestDist && sum < bestSum)) {
+            bestDist = minDist;
+            bestSum = sum;
+            winner = p;
+        }
+    }
+    return winner;
+}
+
 Game::Game(int playerCount) : player_count_(playerCount) {
     reset();
 }
@@ -48,6 +111,8 @@ void Game::reset() {
     winner_ = -1;
     pending_barricade_ = false;
     captured_barricade_ = -1;
+    actions_ = 0;
+    deadlock_ = false;
     for (int p = 0; p < kMaxPlayers; ++p) {
         for (int m = 0; m < kPawnsPerPlayer; ++m) {
             pawns_[p][m] = {-1, -1};  // in base
@@ -181,6 +246,7 @@ bool Game::applyMove(int player, int pawn, Point dest) {
         over_ = true;
         winner_ = player;
     }
+    if (!over_ && ++actions_ >= kMaxActions) resolveDeadlock();
     if (!pending_barricade_ && !over_) nextTurn();
     return true;
 }
@@ -206,6 +272,7 @@ bool Game::placeBarricade(Point dest) {
     barricades_[captured_barricade_] = dest;
     setBarricade(dest);
     pending_barricade_ = false;
+    if (!over_ && ++actions_ >= kMaxActions) resolveDeadlock();
     if (!over_) nextTurn();
     return true;
 }
@@ -215,6 +282,7 @@ bool Game::placeBarricadeFast(Point dest) {
     barricades_[captured_barricade_] = dest;
     setBarricade(dest);
     pending_barricade_ = false;
+    if (!over_ && ++actions_ >= kMaxActions) resolveDeadlock();
     if (!over_) nextTurn();
     return true;
 }
