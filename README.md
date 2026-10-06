@@ -4,7 +4,7 @@ Malefiz (the barricade board game) in C++20 with SDL2: four players, five pawns 
 barricades, a die. The interesting part is the opponent, and the die changes the problem: there
 is no best move, only a best expectation.
 
-Project page: [martinpoiroux.com/en/projects/malefiz](https://martinpoiroux.com/en/projects/malefiz/)
+Project page: [martinpoiroux.com/projets/malefiz/](https://martinpoiroux.com/projets/malefiz/)
 
 ## What is in it
 
