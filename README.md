@@ -1,27 +1,46 @@
-# Barricade Board
+# barricade_board
 
-Board game implementation in C++ with SDL2 rendering and AI opponent.
+Malefiz (the barricade board game) in C++20 with SDL2: four players, five pawns each, eleven
+barricades, a die. The interesting part is the opponent, and the die changes the problem: there
+is no best move, only a best expectation.
 
-## Quick Start
+Project page: [martinpoiroux.com/en/projects/malefiz](https://martinpoiroux.com/en/projects/malefiz/)
+
+## What is in it
+
+- **Rules and state** (`src/board.*`, `src/game.*`) kept apart from rendering, so games can run
+  headless for measurement.
+- **Three opponents** (`src/ai.*`):
+  - a direct heuristic that picks the best pawn/destination pair without searching;
+  - a Monte Carlo tree search that plays games to the end and keeps what wins most often;
+  - the same search guided by a small network (`src/nn.*`) that supplies move priors and a
+    position value instead of random playouts.
+- **Network**: the board is read as twelve planes (pawns of each player, barricades, goal
+  squares, bases, side to move, die value). It trains by self-play (`src/selfplay.cpp`,
+  `src/train.cpp`).
+- **Search telemetry in the UI**: simulations, speed, mean depth, win chance per colour, and the
+  gap between the static estimate and the simulated one. Built mainly to see when the evaluation
+  is wrong.
+
+## Build
+
+Requires CMake 3.20+, a C++20 compiler and [vcpkg](https://vcpkg.io) (SDL2 is declared in
+`vcpkg.json`).
+
 ```bash
-# Requires: vcpkg with SDL2, CMake 3.20+
 cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
-./build/x64/Release/barricade_board.exe
 ```
+
+Targets: `barricade_board` (the game), `smoke_test`, `selfplay`, `train`, `bench`.
 
 ## Test
+
 ```bash
-cmake --build build --target smoke_test --config Release
-./build/x64/Release/smoke_test.exe
+cmake --build build --config Release --target smoke_test
+./build/Release/smoke_test
 ```
 
-## Structure
-- `src/game.*` - Game loop, state machine
-- `src/board.*` - Board representation, rules
-- `src/ai.*` - AI opponent (minimax)
-- `tests/smoke.cpp` - Basic smoke tests
+## License
 
-## Dependencies
-- SDL2 (via vcpkg)
-- C++17 compiler
+MIT
